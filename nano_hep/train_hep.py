@@ -522,6 +522,7 @@ def main():
                     "config": cfg,
                     "gpt_config": gpt_cfg.__dict__,
                     "vocab": {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
+                              "num_quantizers": v.num_quantizers,
                               "offsets": v.offsets, "mod_start": v.mod_start,
                               "eos": v.eos, "pad": v.pad, "total": v.total},
                     "step": step, "val_loss": val["val_loss"],

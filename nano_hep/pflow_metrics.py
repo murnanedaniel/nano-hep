@@ -69,8 +69,19 @@ class PflowMetrics:
         with open(entry["config_path_v"]) as f:
             cfg_v = yaml.safe_load(f)
         key = f"{output_modality}_feat0"
-        self.feat_names = cfg_v["features"][key][1]  # e.g. [truthpart_pt, ...] or [pt, ...]
+        self.feat_names = cfg_v["features"][key][1]
         self.gpos_names = cfg_v["features"][key][3] if len(cfg_v["features"][key]) > 3 else []
+
+        # Build proper inverse-transform objects per continuous feature.
+        # feat_names e.g. ['truthpart_pt', 'truthpart_e'].
+        from hep4m.utility.var_transformation import VarTransformation
+        tdict = cfg_v.get("transformation_dict", {})
+        self._inverters = []
+        for fn in self.feat_names:
+            if fn in tdict:
+                self._inverters.append(VarTransformation(tdict[fn]))
+            else:
+                self._inverters.append(None)
 
     @torch.no_grad()
     def decode_tokens_to_features(self, codes: torch.Tensor, pos_codes: torch.Tensor,
@@ -100,13 +111,13 @@ class PflowMetrics:
         x_gpos = x_gpos_hat.numpy() if x_gpos_hat is not None else None
 
         pt_idx = 0  # first cont feature is pt-like
-        pt_log = "log" in str(self.feat_names[pt_idx]).lower()
+        inv = self._inverters[pt_idx] if pt_idx < len(self._inverters) else None
 
         for b in range(B):
             sel = m[b]
             pt = x_cont[b, sel, pt_idx]
-            if pt_log:
-                pt = np.exp(pt) - 1.0  # undo log1p
+            if inv is not None:
+                pt = inv.inverse(pt)
             if x_gpos is not None and x_gpos.shape[-1] == 3:
                 eta = x_gpos[b, sel, 0]
                 cosphi = x_gpos[b, sel, 1]
