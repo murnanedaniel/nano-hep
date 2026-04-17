@@ -34,7 +34,7 @@ def test_vocab_layout():
 
 
 def test_dataset_shape():
-    ds = HEPDataset(block_size=64, max_events=8)
+    ds = HEPDataset(block_size=64, max_events=8, input_modalities=["track"], output_modality="truthpart")
     assert len(ds) == 8
     x, y, m = ds[0]
     assert x.shape == (63,) and y.shape == (63,) and m.shape == (63,)
@@ -87,9 +87,29 @@ def test_empty_output():
     print(f"[OK] zero-output event {zero_out}: seq built, loss.sum()={m.sum()}")
 
 
+def test_multi_input():
+    """Extended setup: (track, topo) → truthpart."""
+    ds = HEPDataset(block_size=128, max_events=8,
+                    input_modalities=["track", "topo"], output_modality="truthpart")
+    x, y, m = ds[0]
+    assert x.shape == (127,)
+    # Vocab must include 3 modalities and 3 MOD_STARTs
+    assert len(ds.vocab.modalities) == 3
+    assert set(ds.vocab.modalities) == {"track", "topo", "truthpart"}
+    # Build a sequence and verify: track_start, topo_start, truthpart_start all present
+    seq = ds.build_sequence(0)
+    for mod in ["track", "topo", "truthpart"]:
+        assert (seq == ds.vocab.mod_start[mod]).sum() == 1, f"missing MOD_START[{mod}]"
+    # And they appear in the right order
+    positions = {mod: int(np.where(seq == ds.vocab.mod_start[mod])[0][0]) for mod in ["track", "topo", "truthpart"]}
+    assert positions["track"] < positions["topo"] < positions["truthpart"]
+    print(f"[OK] multi-input track+topo → truthpart, positions={positions}")
+
+
 if __name__ == "__main__":
     test_vocab_layout()
     test_dataset_shape()
     test_loss_mask_bounds()
     test_empty_output()
+    test_multi_input()
     print("\nAll data/vocab tests passed.")

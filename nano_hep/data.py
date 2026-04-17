@@ -82,12 +82,12 @@ class ModalityMemmap:
 
 
 class HEPDataset(Dataset):
-    """Autoregressive dataset over (input_modality → output_modality) sequences.
+    """Autoregressive dataset over (inputs → output) sequences.
 
-    Returns (x, y, loss_mask) with `x` / `y` / `loss_mask` shape (block_size,).
-    - x: token IDs
-    - y = next-token labels (x shifted left by 1, last=PAD)
-    - loss_mask = 1 where `y` should be counted (output region only, excluding PAD)
+    inputs is a list of modality names fed in order; output is a single modality.
+
+    Returns (x, y, loss_mask) shape (block_size - 1,). Loss mask = 1 for positions
+    where y should be counted (output-region targets only).
     """
 
     DEFAULT_ROOT = "/global/cfs/cdirs/m4958/data/COCOA/Tokenized"
@@ -96,29 +96,28 @@ class HEPDataset(Dataset):
         self,
         tokenized_root: str = DEFAULT_ROOT,
         split: str = "train",
-        input_modality: str = "track",
+        input_modalities: list = ["track"],
         output_modality: str = "truthpart",
         block_size: int = 256,
         max_events: int = -1,
         vocab: Vocab | None = None,
     ):
         self.split = split
-        self.input_modality = input_modality
+        self.input_modalities = list(input_modalities)
         self.output_modality = output_modality
         self.block_size = block_size
 
-        self.inp_mm = ModalityMemmap.load(tokenized_root, split, input_modality)
+        self.inp_mms = {m: ModalityMemmap.load(tokenized_root, split, m) for m in self.input_modalities}
         self.out_mm = ModalityMemmap.load(tokenized_root, split, output_modality)
-        assert self.inp_mm.n_events == self.out_mm.n_events, \
-            f"mismatch n_events: {self.inp_mm.n_events} vs {self.out_mm.n_events}"
+        n_events_all = [self.out_mm.n_events] + [mm.n_events for mm in self.inp_mms.values()]
+        assert len(set(n_events_all)) == 1, f"n_events mismatch across modalities: {n_events_all}"
 
-        self.n_events_total = self.inp_mm.n_events
+        self.n_events_total = self.out_mm.n_events
         self.n_events = min(self.n_events_total, max_events) if max_events > 0 else self.n_events_total
 
         if vocab is None:
-            vocab = Vocab.build([input_modality, output_modality],
-                                {input_modality: DEFAULT_MODALITY_VOCAB[input_modality],
-                                 output_modality: DEFAULT_MODALITY_VOCAB[output_modality]})
+            all_mods = self.input_modalities + [output_modality]
+            vocab = Vocab.build(all_mods, {m: DEFAULT_MODALITY_VOCAB[m] for m in all_mods})
         self.vocab = vocab
 
     def __len__(self) -> int:
@@ -128,26 +127,23 @@ class HEPDataset(Dataset):
 
     def build_sequence(self, idx: int) -> np.ndarray:
         """Returns a (block_size,) int64 array — PAD on the right."""
-        inp_q0 = self.inp_mm.event_q0(idx)
+        parts = []
+        for m in self.input_modalities:
+            q0 = self.inp_mms[m].event_q0(idx)
+            V = self.vocab.vocab_sizes[m]
+            q0 = np.clip(q0, 0, V - 1)
+            parts.append(np.array([self.vocab.mod_start[m]], dtype=np.int64))
+            parts.append(q0 + self.vocab.offsets[m])
+        # Output block
         out_q0 = self.out_mm.event_q0(idx)
-        # Clip token IDs to valid range (some saved tokens can be out-of-band sentinels)
-        V_in = self.vocab.vocab_sizes[self.input_modality]
         V_out = self.vocab.vocab_sizes[self.output_modality]
-        inp_q0 = np.clip(inp_q0, 0, V_in - 1)
         out_q0 = np.clip(out_q0, 0, V_out - 1)
-        inp_global = inp_q0 + self.vocab.offsets[self.input_modality]
-        out_global = out_q0 + self.vocab.offsets[self.output_modality]
-        # Layout: MOD_start[in], inp_global..., MOD_start[out], out_global..., EOS, PAD...
-        parts = [
-            np.array([self.vocab.mod_start[self.input_modality]], dtype=np.int64),
-            inp_global,
-            np.array([self.vocab.mod_start[self.output_modality]], dtype=np.int64),
-            out_global,
-            np.array([self.vocab.eos], dtype=np.int64),
-        ]
+        parts.append(np.array([self.vocab.mod_start[self.output_modality]], dtype=np.int64))
+        parts.append(out_q0 + self.vocab.offsets[self.output_modality])
+        parts.append(np.array([self.vocab.eos], dtype=np.int64))
+
         seq = np.concatenate(parts)
         if len(seq) > self.block_size:
-            # truncate — output region may be partially cut; keep as much as possible
             seq = seq[: self.block_size]
         else:
             pad_len = self.block_size - len(seq)
@@ -155,32 +151,24 @@ class HEPDataset(Dataset):
         return seq
 
     def build_loss_mask(self, seq: np.ndarray) -> np.ndarray:
-        """Loss mask for y = seq shifted left. A position i contributes loss iff
-        y[i] = seq[i+1] is a *real output token or EOS* (not input, not PAD).
-        """
-        # Find the MOD_start of the OUTPUT modality
+        """Loss mask for y = seq shifted left. 1 iff y[i] is in the output region
+        (from output's MOD_START through EOS, inclusive)."""
         out_start_tok = self.vocab.mod_start[self.output_modality]
         pad_tok = self.vocab.pad
+        eos_tok = self.vocab.eos
         where_out_start = np.where(seq == out_start_tok)[0]
         loss = np.zeros(self.block_size, dtype=np.int64)
         if len(where_out_start) == 0:
             return loss
         out_start_pos = int(where_out_start[0])
-        # y[i] = seq[i+1]; we want y[i] ∈ output-region.
-        # Output tokens occupy positions [out_start_pos+1, eos_pos] in seq (inclusive of EOS).
-        eos_tok = self.vocab.eos
         where_eos = np.where(seq == eos_tok)[0]
         if len(where_eos) == 0:
-            # truncated before EOS; count all positions up to last non-pad
             last_nonpad = int(np.where(seq != pad_tok)[0][-1])
-            y_end = last_nonpad  # y[i] = seq[i+1]; can compute y up to i = block_size-2
+            y_end = last_nonpad
         else:
             y_end = int(where_eos[0])
-        # positions i for which y[i] is a target: out_start_pos <= i < y_end
-        # (so y[i] = seq[i+1] covers from out_start_pos+1 to y_end)
         y_start = out_start_pos
         loss[y_start:y_end] = 1
-        # sanity: cap at block_size - 1 (no loss at last position since there's no y)
         if loss[-1] == 1:
             loss[-1] = 0
         return loss
@@ -188,7 +176,21 @@ class HEPDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         seq = self.build_sequence(idx)
         loss_mask = self.build_loss_mask(seq)
-        x = torch.from_numpy(seq[:-1]).long()   # (block_size - 1,)
-        y = torch.from_numpy(seq[1:]).long()    # (block_size - 1,)
-        m = torch.from_numpy(loss_mask[:-1]).long()  # aligned with x → y prediction
+        x = torch.from_numpy(seq[:-1]).long()
+        y = torch.from_numpy(seq[1:]).long()
+        m = torch.from_numpy(loss_mask[:-1]).long()
         return x, y, m
+
+    # --- metric helpers (used by train_hep.py val) ---------------------------
+
+    def output_region_slice(self, seq: np.ndarray):
+        """Return (output_start_pos, eos_pos) for seq. eos_pos = block_size if none."""
+        out_start = int(np.where(seq == self.vocab.mod_start[self.output_modality])[0][0])
+        eos_hits = np.where(seq == self.vocab.eos)[0]
+        eos_pos = int(eos_hits[0]) if len(eos_hits) else int(self.block_size - 1)
+        return out_start, eos_pos
+
+    def true_cardinality(self, idx: int) -> int:
+        """Number of real output-modality tokens (elements) for event idx."""
+        a = int(self.out_mm.offsets[idx]); b = int(self.out_mm.offsets[idx + 1])
+        return b - a

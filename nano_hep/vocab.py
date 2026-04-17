@@ -39,20 +39,28 @@ class Vocab:
 
     @staticmethod
     def build(modalities: List[str], vocab_sizes: Dict[str, int]) -> "Vocab":
+        """`modalities` is the ordered list of all modalities that can appear in a sequence
+        (inputs first, then outputs). Token IDs are assigned disjointly; a MOD_START
+        special is created per modality."""
         assert all(m in vocab_sizes for m in modalities), f"missing vocab_sizes for some of {modalities}"
+        # dedupe while preserving order
+        seen = set(); mods_ord = []
+        for m in modalities:
+            if m not in seen:
+                seen.add(m); mods_ord.append(m)
         offsets: Dict[str, int] = {}
         cursor = 0
-        for m in modalities:
+        for m in mods_ord:
             offsets[m] = cursor
             cursor += vocab_sizes[m]
         # specials: one MOD_START per modality, then EOS, then PAD
-        mod_start = {m: cursor + i for i, m in enumerate(modalities)}
-        cursor += len(modalities)
+        mod_start = {m: cursor + i for i, m in enumerate(mods_ord)}
+        cursor += len(mods_ord)
         eos = cursor; cursor += 1
         pad = cursor; cursor += 1
         return Vocab(
-            modalities=list(modalities),
-            vocab_sizes=dict(vocab_sizes),
+            modalities=list(mods_ord),
+            vocab_sizes={m: vocab_sizes[m] for m in mods_ord},
             offsets=dict(offsets),
             mod_start=dict(mod_start),
             eos=eos,

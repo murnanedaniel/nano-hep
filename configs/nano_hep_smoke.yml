@@ -1,9 +1,9 @@
 # nano-hep smoke config — 10k events, 500 steps, 1 GPU, ~10 min
 data:
   tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
-  input_modality: track
+  input_modalities: [track, topo]     # match HEP4M pflow's input set
   output_modality: truthpart
-  block_size: 128           # max ~(track_elems + truthpart_elems + 3) — with ~10 elems per modality is comfortable
+  block_size: 192                      # 1 + N_trk + 1 + N_topo + 1 + N_truth + 1 EOS, conservatively
   max_train_events: 10000
   max_val_events: 500
 
@@ -35,7 +35,8 @@ training:
   num_workers: 2
   compile: false
   bf16: true
+  ar_eval_events: 64       # number of val events for autoregressive cardinality/EOS metrics
   out_dir: runs/smoke
   wandb: true
   wandb_project: nano-hep
-  run_name: smoke-v0
+  run_name: smoke-v1-multi

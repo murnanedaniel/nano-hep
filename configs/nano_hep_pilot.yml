@@ -1,9 +1,9 @@
 # nano-hep pilot: 100k events, 5k steps, 1 GPU, ~1h
 data:
   tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
-  input_modality: track
+  input_modalities: [track, topo]
   output_modality: truthpart
-  block_size: 128
+  block_size: 192
   max_train_events: 100000
   max_val_events: 2000
 
@@ -35,7 +35,8 @@ training:
   num_workers: 3
   compile: false
   bf16: true
+  ar_eval_events: 128
   out_dir: runs/pilot
   wandb: true
   wandb_project: nano-hep
-  run_name: pilot-v0
+  run_name: pilot-v1-multi

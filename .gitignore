@@ -7,6 +7,11 @@ __pycache__/
 *.pkl
 *.pt
 *.pyc
+*.ckpt
 input.txt
 env/
 venv/
+
+# nano_hep experiment artifacts
+runs/
+wandb/

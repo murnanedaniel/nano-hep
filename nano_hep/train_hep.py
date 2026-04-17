@@ -56,23 +56,139 @@ def _get_lr(step: int, cfg: Dict[str, Any]) -> float:
 
 
 @torch.no_grad()
-def estimate_val_loss(model, val_loader, device, max_batches: int = 10) -> Dict[str, float]:
+def estimate_val_loss(model, val_loader, device, vocab, max_batches: int = 10) -> Dict[str, float]:
+    """Teacher-forced metrics: val_loss, token_accuracy on output positions."""
     model.eval()
     losses = []
     total_tokens = 0
+    n_correct = 0
+    n_total = 0
     for i, (x, y, m) in enumerate(val_loader):
         if i >= max_batches: break
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         m = m.to(device, non_blocking=True)
         y_mask = _apply_loss_mask(y, m)
-        _, loss = model(x, targets=y_mask)
+        logits, loss = model(x, targets=y_mask)
         if loss is not None and not torch.isnan(loss):
             losses.append(loss.item())
             total_tokens += m.sum().item()
+        # token accuracy on loss-mask positions
+        pred = logits.argmax(dim=-1)  # (B, T)
+        mask_bool = m.bool()
+        n_correct += ((pred == y) & mask_bool).sum().item()
+        n_total += mask_bool.sum().item()
     model.train()
-    return {"val_loss": float(np.mean(losses)) if losses else float("nan"),
-            "val_tokens": total_tokens}
+    return {
+        "val_loss": float(np.mean(losses)) if losses else float("nan"),
+        "val_tokens": total_tokens,
+        "val_token_accuracy": float(n_correct / max(n_total, 1)),
+    }
+
+
+@torch.no_grad()
+def autoregressive_eval(
+    model,
+    val_ds,
+    device,
+    vocab,
+    n_events: int = 64,
+    max_new_tokens: int = 64,
+) -> Dict[str, Any]:
+    """Run AR generation on a small val subset. For each event:
+      1. Feed the prefix up through MOD_START[output] and generate tokens greedily.
+      2. Stop at EOS or max_new_tokens.
+      3. Compute predicted cardinality = count of output-modality tokens emitted
+         before EOS.
+
+    Reports:
+      ar_cardinality_acc  — fraction of events where pred cardinality == true.
+      ar_cardinality_mae  — mean |pred − true|.
+      ar_n_pred_mean/std  — cardinality-pred stats.
+      ar_n_true_mean/std  — cardinality-true stats.
+      ar_eos_position_error — mean |predicted EOS pos − true EOS pos|.
+      ar_token_accuracy   — accuracy of generated tokens vs teacher tokens,
+                            when compared position by position up to min(pred, true).
+      ar_scatter_npy      — (n_events,2) array (n_true, n_pred).
+    """
+    model.eval()
+    out_mod = val_ds.output_modality
+    out_offset = vocab.offsets[out_mod]
+    V_out = vocab.vocab_sizes[out_mod]
+    out_token_range = (out_offset, out_offset + V_out)
+    eos_id = vocab.eos
+    pad_id = vocab.pad
+    mod_start_out = vocab.mod_start[out_mod]
+
+    n_true_list, n_pred_list, eos_pos_err, ar_n_correct, ar_n_total = [], [], [], 0, 0
+
+    for i in range(min(n_events, len(val_ds))):
+        seq = val_ds.build_sequence(i)  # (block_size,) int64
+        out_start_pos, true_eos_pos = val_ds.output_region_slice(seq)
+        n_true = true_eos_pos - (out_start_pos + 1)  # tokens between MOD_START[out] and EOS
+        # Prefix: everything up through MOD_START[out] (inclusive)
+        prefix_len = out_start_pos + 1
+        prefix = torch.from_numpy(seq[:prefix_len]).long().unsqueeze(0).to(device)
+
+        # Autoregressive generation
+        cur = prefix
+        n_pred = 0
+        emitted = []
+        max_len = min(val_ds.block_size, prefix_len + max_new_tokens)
+        ended = False
+        while cur.shape[1] < max_len:
+            logits, _ = model(cur)  # (B=1, 1, V)
+            next_tok = int(logits[0, -1].argmax().item())
+            emitted.append(next_tok)
+            cur = torch.cat([cur, torch.tensor([[next_tok]], device=device, dtype=torch.long)], dim=1)
+            if next_tok == eos_id:
+                ended = True
+                break
+            # Count output-modality tokens
+            if out_token_range[0] <= next_tok < out_token_range[1]:
+                n_pred += 1
+
+        # Predicted EOS position = len(prefix) + len(emitted) - 1 (inclusive of the EOS if ended)
+        if ended:
+            pred_eos_pos = prefix_len + len(emitted) - 1
+        else:
+            pred_eos_pos = prefix_len + len(emitted)  # ran out without EOS
+        eos_pos_err.append(abs(pred_eos_pos - true_eos_pos))
+
+        # Teacher tokens for accuracy (between out_start_pos+1 and true_eos_pos)
+        teacher = seq[out_start_pos + 1 : true_eos_pos]  # includes neither MOD_START[out] nor EOS
+        # Predicted output tokens (emitted excluding EOS if present)
+        if ended:
+            pred_tokens = emitted[:-1]
+        else:
+            pred_tokens = emitted
+        k = min(len(pred_tokens), len(teacher))
+        if k > 0:
+            t = np.asarray(teacher[:k])
+            p = np.asarray(pred_tokens[:k])
+            ar_n_correct += int((t == p).sum())
+            ar_n_total += k
+
+        n_true_list.append(int(n_true))
+        n_pred_list.append(int(n_pred))
+
+    n_true_arr = np.asarray(n_true_list)
+    n_pred_arr = np.asarray(n_pred_list)
+    resid = n_pred_arr - n_true_arr
+    out = {
+        "ar_cardinality_acc": float((n_pred_arr == n_true_arr).mean()),
+        "ar_cardinality_mae": float(np.abs(resid).mean()),
+        "ar_n_pred_mean": float(n_pred_arr.mean()),
+        "ar_n_pred_std": float(n_pred_arr.std()),
+        "ar_n_true_mean": float(n_true_arr.mean()),
+        "ar_n_true_std": float(n_true_arr.std()),
+        "ar_eos_position_error": float(np.mean(eos_pos_err)),
+        "ar_token_accuracy": float(ar_n_correct / max(ar_n_total, 1)),
+        "_n_true_arr": n_true_arr,  # for wandb plots (popped before logging scalars)
+        "_n_pred_arr": n_pred_arr,
+    }
+    model.train()
+    return out
 
 
 def main():
@@ -94,17 +210,20 @@ def main():
     dtype = torch.bfloat16 if cfg["training"].get("bf16", True) and device == "cuda" else torch.float32
 
     # ---- data -----------------------------------------------------------------
-    in_mod = cfg["data"]["input_modality"]
+    # Accept either `input_modality` (single, legacy) or `input_modalities` (list, new).
+    if "input_modalities" in cfg["data"]:
+        in_mods = list(cfg["data"]["input_modalities"])
+    else:
+        in_mods = [cfg["data"]["input_modality"]]
     out_mod = cfg["data"]["output_modality"]
-    v = Vocab.build([in_mod, out_mod],
-                    {in_mod: DEFAULT_MODALITY_VOCAB[in_mod],
-                     out_mod: DEFAULT_MODALITY_VOCAB[out_mod]})
+    all_mods = in_mods + [out_mod]
+    v = Vocab.build(all_mods, {m: DEFAULT_MODALITY_VOCAB[m] for m in all_mods})
     print(f"Vocab: {v}")
 
     train_ds = HEPDataset(
         tokenized_root=cfg["data"]["tokenized_root"],
         split="train",
-        input_modality=in_mod, output_modality=out_mod,
+        input_modalities=in_mods, output_modality=out_mod,
         block_size=cfg["data"]["block_size"],
         max_events=cfg["data"].get("max_train_events", -1),
         vocab=v,
@@ -112,7 +231,7 @@ def main():
     val_ds = HEPDataset(
         tokenized_root=cfg["data"]["tokenized_root"],
         split="val",
-        input_modality=in_mod, output_modality=out_mod,
+        input_modalities=in_mods, output_modality=out_mod,
         block_size=cfg["data"]["block_size"],
         max_events=cfg["data"].get("max_val_events", 512),
         vocab=v,
@@ -208,10 +327,49 @@ def main():
             t_last = now
 
         if step % val_every == 0 or step == max_steps:
-            val = estimate_val_loss(model, val_loader, device, max_batches=10)
-            print(f"  val_loss {val['val_loss']:.4f}  val_tokens {val['val_tokens']}", flush=True)
+            val = estimate_val_loss(model, val_loader, device, v, max_batches=10)
+            ar_n_events = cfg["training"].get("ar_eval_events", 64)
+            ar = autoregressive_eval(model, val_ds, device, v,
+                                     n_events=ar_n_events,
+                                     max_new_tokens=val_ds.block_size)
+            print(f"  val_loss {val['val_loss']:.4f}  tok_acc {val['val_token_accuracy']:.3f}  "
+                  f"ar_card_acc {ar['ar_cardinality_acc']:.3f}  ar_card_mae {ar['ar_cardinality_mae']:.2f}  "
+                  f"ar_tok_acc {ar['ar_token_accuracy']:.3f}  ar_n_pred {ar['ar_n_pred_mean']:.1f}±{ar['ar_n_pred_std']:.1f}  "
+                  f"(n_true {ar['ar_n_true_mean']:.1f}±{ar['ar_n_true_std']:.1f})",
+                  flush=True)
             if use_wandb:
-                wandb.log({"val/loss": val["val_loss"], "val/tokens_seen": val["val_tokens"], "step": step})
+                log_dict = {
+                    "val/loss": val["val_loss"],
+                    "val/tokens_seen": val["val_tokens"],
+                    "val/token_accuracy": val["val_token_accuracy"],
+                    "step": step,
+                }
+                for k, vv in ar.items():
+                    if not k.startswith("_"):
+                        log_dict[f"val/{k}"] = vv
+                # Cardinality scatter plot (wandb Image) every val
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
+                    n_true = ar["_n_true_arr"]; n_pred = ar["_n_pred_arr"]
+                    mx = max(n_true.max(), n_pred.max(), 1) + 1
+                    ax1.scatter(n_true, n_pred, alpha=0.3, s=10)
+                    ax1.plot([0, mx], [0, mx], "k--", lw=0.5)
+                    ax1.set_xlabel("n_true"); ax1.set_ylabel("n_pred")
+                    ax1.set_title(f"cardinality: pred vs true  (step {step})")
+                    bins = np.arange(0, mx + 1) - 0.5
+                    ax2.hist(n_true, bins=bins, alpha=0.5, label="true", density=True)
+                    ax2.hist(n_pred, bins=bins, alpha=0.5, label="pred", density=True)
+                    ax2.set_xlabel("cardinality"); ax2.legend(fontsize=8)
+                    ax2.set_title(f"cardinality hist  acc={ar['ar_cardinality_acc']:.2f} mae={ar['ar_cardinality_mae']:.1f}")
+                    fig.tight_layout()
+                    log_dict["val/cardinality_plot"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"  (skipped cardinality plot: {e})")
+                wandb.log(log_dict)
             if val["val_loss"] < best_val:
                 best_val = val["val_loss"]
                 torch.save({
