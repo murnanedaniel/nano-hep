@@ -13,49 +13,49 @@ from .data import HEPDataset
 def test_vocab_q0_only():
     """num_q=1 per modality: each modality block is just codebook_size wide."""
     v = Vocab.build(["track", "truthpart"],
-                    {"track": 1024, "truthpart": 1024},
+                    {"track": 256, "truthpart": 128},
                     {"track": 1, "truthpart": 1})
     assert v.offsets["track"] == 0
-    assert v.offsets["truthpart"] == 1024
-    assert v.mod_start["track"] == 2048
-    assert v.mod_start["truthpart"] == 2049
-    assert v.total == 2052
+    assert v.offsets["truthpart"] == 256
+    assert v.mod_start["track"] == 256 + 128
+    assert v.mod_start["truthpart"] == 256 + 128 + 1
+    assert v.total == 256 + 128 + 4  # +2 mod_starts +EOS +PAD
 
-    # encode triples with (N, 1) shape
-    codes = np.array([[0], [5], [1023]])
+    codes = np.array([[0], [5], [255]])
     enc = v.encode_element_triples("track", codes)
-    assert enc.tolist() == [0, 5, 1023]
-    enc = v.encode_element_triples("truthpart", codes)
-    assert enc.tolist() == [1024, 1029, 2047]
+    assert enc.tolist() == [0, 5, 255]
+    codes_tp = np.array([[0], [5], [127]])
+    enc = v.encode_element_triples("truthpart", codes_tp)
+    assert enc.tolist() == [256, 261, 383]
 
-    mods, qs, locals_ = v.decode_global([0, 1024, 2048, 2050])
+    mods, qs, locals_ = v.decode_global([0, 256, v.mod_start["track"], v.eos])
     assert mods.tolist() == ["track", "truthpart", "<MOD:track_start>", "<EOS>"]
-    print("[OK] vocab q0-only round-trip")
+    print("[OK] vocab q0-only round-trip (track=256, truthpart=128)")
 
 
 def test_vocab_multi_q():
-    """num_q=3 per modality: each modality block is 3*codebook_size wide."""
+    """num_q=3 per modality with correct codebook sizes."""
     v = Vocab.build(["track", "truthpart"],
-                    {"track": 1024, "truthpart": 1024},
+                    {"track": 256, "truthpart": 128},
                     {"track": 3, "truthpart": 3})
-    # track: [0, 3072), truthpart: [3072, 6144), mod_starts at 6144
+    # track block: 3*256=768 → [0, 768), truthpart block: 3*128=384 → [768, 1152)
     assert v.offsets["track"] == 0
-    assert v.offsets["truthpart"] == 3072
-    assert v.mod_start["track"] == 6144
-    assert v.eos == 6146
-    assert v.total == 6148
+    assert v.offsets["truthpart"] == 768
+    assert v.mod_start["track"] == 1152
+    assert v.eos == 1154
+    assert v.total == 1156
 
-    # encode: 2 elements, each with 3 quantizer codes
-    codes = np.array([[5, 10, 15], [100, 200, 300]])  # (2, 3)
+    # encode: 2 track elements, each with 3 quantizer codes (0..255 range)
+    codes = np.array([[5, 10, 15], [100, 200, 255]])  # (2, 3)
     enc = v.encode_element_triples("track", codes)
-    # el0: q0=5 (→5), q1=10 (→1024+10=1034), q2=15 (→2048+15=2063)
-    # el1: q0=100 (→100), q1=200 (→1024+200=1224), q2=300 (→2048+300=2348)
-    assert enc.tolist() == [5, 1034, 2063, 100, 1224, 2348]
+    # el0: q0=5, q1=256+10=266, q2=512+15=527
+    # el1: q0=100, q1=256+200=456, q2=512+255=767
+    assert enc.tolist() == [5, 266, 527, 100, 456, 767]
 
     # round-trip decode
     recovered = v.decode_modality_triples("track", enc)
     assert recovered.tolist() == codes.tolist()
-    print("[OK] vocab multi-q round-trip (3 quantizers)")
+    print("[OK] vocab multi-q round-trip (3 quantizers, real sizes)")
 
 
 def test_dataset_shape():

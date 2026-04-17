@@ -150,9 +150,13 @@ class Vocab:
                 f"mod_start={self.mod_start}, eos={self.eos}, pad={self.pad})")
 
 
-# Defaults: codebook size 1024, 3 quantizers per modality (matches COCOA/Tokenized VQVAEs)
+# Defaults match the COCOA VQ-VAE checkpoints at
+# /global/cfs/cdirs/m4958/data/COCOA/Checkpoints/vqx{track,topo,trpart,trjet}_.../config_m.yml
 DEFAULT_MODALITY_CODEBOOK_SIZE: Dict[str, int] = {
-    "track": 1024, "topo": 1024, "truthpart": 1024, "truthjet": 1024,
+    "track": 256,
+    "topo": 256,
+    "truthpart": 128,
+    "truthjet": 128,
 }
 DEFAULT_MODALITY_NUM_QUANTIZERS: Dict[str, int] = {
     "track": 3, "topo": 3, "truthpart": 3, "truthjet": 1,
