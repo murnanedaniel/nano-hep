@@ -1,0 +1,41 @@
+# nano-hep smoke config — 10k events, 500 steps, 1 GPU, ~10 min
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modality: track
+  output_modality: truthpart
+  block_size: 128           # max ~(track_elems + truthpart_elems + 3) — with ~10 elems per modality is comfortable
+  max_train_events: 10000
+  max_val_events: 500
+
+model:
+  n_layer: 6
+  n_head: 4
+  n_embd: 256
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 3.0e-4
+  floor: 3.0e-5
+  warmup_steps: 50
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+training:
+  seed: 42
+  batch_size: 64
+  max_steps: 500
+  log_every: 25
+  val_every: 100
+  ckpt_every: 500
+  grad_clip: 1.0
+  num_workers: 2
+  compile: false
+  bf16: true
+  out_dir: runs/smoke
+  wandb: true
+  wandb_project: nano-hep
+  run_name: smoke-v0
