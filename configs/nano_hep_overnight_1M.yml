@@ -1,0 +1,48 @@
+# nano-hep overnight — 3-quantizer, 1M events, scaled model, 1-GPU shared alloc
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: 1000000
+  max_val_events: 2000
+
+model:
+  # scale from 26.8M (n_layer=8,n_head=8,n_embd=512) to ~80M
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 3.0e-4
+  floor: 3.0e-5
+  warmup_steps: 500
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: true
+  modality_dict_path: /global/cfs/cdirs/m4958/usr/danieltm/Side_Work/FoundationModels/HEP4M/data/experiments/HEP4M-pflow-pilot/pflow_pilot_10M_nocard/modality_dict.yml
+
+training:
+  seed: 42
+  batch_size: 64        # scaled model + longer seqs; will use grad accum-free
+  max_steps: 80000      # 1M / 64 = 15,625 per epoch → ~5 epochs
+  log_every: 100
+  val_every: 2000
+  ckpt_every: 5000
+  grad_clip: 1.0
+  num_workers: 4
+  compile: false
+  bf16: true
+  ar_eval_events: 256
+  out_dir: runs/overnight_1M
+  wandb: true
+  wandb_project: nano-hep
+  run_name: overnight-1M-80M
