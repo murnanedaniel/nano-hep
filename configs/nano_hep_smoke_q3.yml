@@ -1,0 +1,44 @@
+# nano-hep smoke — 3-quantizer (matches HEP4M's 3 residual codebooks)
+# 10k events, 500 steps, 1 GPU
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3                    # use all 3 codebooks per element
+  block_size: 320                      # ~3x q0-only: need room for 3*N_elems per mod
+  max_train_events: 10000
+  max_val_events: 500
+
+model:
+  n_layer: 6
+  n_head: 4
+  n_embd: 256
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 3.0e-4
+  floor: 3.0e-5
+  warmup_steps: 50
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+training:
+  seed: 42
+  batch_size: 64
+  max_steps: 500
+  log_every: 25
+  val_every: 100
+  ckpt_every: 500
+  grad_clip: 1.0
+  num_workers: 2
+  compile: false
+  bf16: true
+  ar_eval_events: 64
+  out_dir: runs/smoke_q3
+  wandb: true
+  wandb_project: nano-hep
+  run_name: smoke-q3

@@ -41,7 +41,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .vocab import Vocab, DEFAULT_MODALITY_VOCAB
+from .vocab import Vocab, DEFAULT_MODALITY_CODEBOOK_SIZE, DEFAULT_MODALITY_NUM_QUANTIZERS
 
 
 @dataclass
@@ -80,6 +80,15 @@ class ModalityMemmap:
         col0 = self.data[a:b, 0].astype(np.int64)
         return col0
 
+    def event_codes(self, idx: int, num_q: int) -> np.ndarray:
+        """Return the first `num_q` codebook columns for event `idx`, shape (n_elems, num_q) int64."""
+        a = int(self.offsets[idx]); b = int(self.offsets[idx + 1])
+        if b == a:
+            return np.empty((0, num_q), dtype=np.int64)
+        assert num_q <= self.n_codebooks, f"requested num_q={num_q} > n_codebooks={self.n_codebooks}"
+        cols = self.data[a:b, :num_q].astype(np.int64)
+        return cols
+
 
 class HEPDataset(Dataset):
     """Autoregressive dataset over (inputs → output) sequences.
@@ -101,6 +110,7 @@ class HEPDataset(Dataset):
         block_size: int = 256,
         max_events: int = -1,
         vocab: Vocab | None = None,
+        num_quantizers: "dict | int" = 1,
     ):
         self.split = split
         self.input_modalities = list(input_modalities)
@@ -117,8 +127,17 @@ class HEPDataset(Dataset):
 
         if vocab is None:
             all_mods = self.input_modalities + [output_modality]
-            vocab = Vocab.build(all_mods, {m: DEFAULT_MODALITY_VOCAB[m] for m in all_mods})
+            if isinstance(num_quantizers, int):
+                num_q_map = {m: num_quantizers for m in all_mods}
+            else:
+                num_q_map = dict(num_quantizers)
+            vocab = Vocab.build(
+                all_mods,
+                {m: DEFAULT_MODALITY_CODEBOOK_SIZE[m] for m in all_mods},
+                num_q_map,
+            )
         self.vocab = vocab
+        self.num_q = self.vocab.num_quantizers
 
     def __len__(self) -> int:
         return self.n_events
@@ -126,20 +145,29 @@ class HEPDataset(Dataset):
     # --- sequence building ---------------------------------------------------
 
     def build_sequence(self, idx: int) -> np.ndarray:
-        """Returns a (block_size,) int64 array — PAD on the right."""
+        """Returns a (block_size,) int64 array — PAD on the right.
+
+        Each modality block emits `num_q[mod]` tokens per element, interleaved:
+        MOD_START, el0_q0, el0_q1, el0_q2, el1_q0, el1_q1, el1_q2, ...
+        """
         parts = []
         for m in self.input_modalities:
-            q0 = self.inp_mms[m].event_q0(idx)
-            V = self.vocab.vocab_sizes[m]
-            q0 = np.clip(q0, 0, V - 1)
+            num_q = self.num_q[m]
+            codes = self.inp_mms[m].event_codes(idx, num_q)  # (N, num_q)
+            V = self.vocab.codebook_sizes[m]
+            codes = np.clip(codes, 0, V - 1)
+            flat = self.vocab.encode_element_triples(m, codes)
             parts.append(np.array([self.vocab.mod_start[m]], dtype=np.int64))
-            parts.append(q0 + self.vocab.offsets[m])
+            parts.append(flat)
         # Output block
-        out_q0 = self.out_mm.event_q0(idx)
-        V_out = self.vocab.vocab_sizes[self.output_modality]
-        out_q0 = np.clip(out_q0, 0, V_out - 1)
-        parts.append(np.array([self.vocab.mod_start[self.output_modality]], dtype=np.int64))
-        parts.append(out_q0 + self.vocab.offsets[self.output_modality])
+        out_m = self.output_modality
+        num_q_out = self.num_q[out_m]
+        out_codes = self.out_mm.event_codes(idx, num_q_out)
+        V_out = self.vocab.codebook_sizes[out_m]
+        out_codes = np.clip(out_codes, 0, V_out - 1)
+        out_flat = self.vocab.encode_element_triples(out_m, out_codes)
+        parts.append(np.array([self.vocab.mod_start[out_m]], dtype=np.int64))
+        parts.append(out_flat)
         parts.append(np.array([self.vocab.eos], dtype=np.int64))
 
         seq = np.concatenate(parts)

@@ -32,7 +32,7 @@ sys.path.insert(0, str(_REPO))
 
 from model import GPT, GPTConfig  # noqa: E402  (upstream nanoGPT)
 from .data import HEPDataset      # noqa: E402
-from .vocab import Vocab, DEFAULT_MODALITY_VOCAB  # noqa: E402
+from .vocab import Vocab, DEFAULT_MODALITY_CODEBOOK_SIZE, DEFAULT_MODALITY_NUM_QUANTIZERS  # noqa: E402
 
 
 def _apply_loss_mask(y: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
@@ -114,8 +114,10 @@ def autoregressive_eval(
     model.eval()
     out_mod = val_ds.output_modality
     out_offset = vocab.offsets[out_mod]
-    V_out = vocab.vocab_sizes[out_mod]
-    out_token_range = (out_offset, out_offset + V_out)
+    num_q_out = vocab.num_quantizers[out_mod]
+    V_out = vocab.codebook_sizes[out_mod]
+    out_block_size = num_q_out * V_out  # total width of modality block
+    out_token_range = (out_offset, out_offset + out_block_size)
     eos_id = vocab.eos
     pad_id = vocab.pad
     mod_start_out = vocab.mod_start[out_mod]
@@ -125,14 +127,15 @@ def autoregressive_eval(
     for i in range(min(n_events, len(val_ds))):
         seq = val_ds.build_sequence(i)  # (block_size,) int64
         out_start_pos, true_eos_pos = val_ds.output_region_slice(seq)
-        n_true = true_eos_pos - (out_start_pos + 1)  # tokens between MOD_START[out] and EOS
+        n_true_tokens = true_eos_pos - (out_start_pos + 1)  # tokens between MOD_START[out] and EOS
+        n_true = n_true_tokens // num_q_out   # number of elements (particles)
         # Prefix: everything up through MOD_START[out] (inclusive)
         prefix_len = out_start_pos + 1
         prefix = torch.from_numpy(seq[:prefix_len]).long().unsqueeze(0).to(device)
 
         # Autoregressive generation
         cur = prefix
-        n_pred = 0
+        n_pred_tokens = 0
         emitted = []
         max_len = min(val_ds.block_size, prefix_len + max_new_tokens)
         ended = False
@@ -146,7 +149,8 @@ def autoregressive_eval(
                 break
             # Count output-modality tokens
             if out_token_range[0] <= next_tok < out_token_range[1]:
-                n_pred += 1
+                n_pred_tokens += 1
+        n_pred = n_pred_tokens // num_q_out  # elements
 
         # Predicted EOS position = len(prefix) + len(emitted) - 1 (inclusive of the EOS if ended)
         if ended:
@@ -217,7 +221,15 @@ def main():
         in_mods = [cfg["data"]["input_modality"]]
     out_mod = cfg["data"]["output_modality"]
     all_mods = in_mods + [out_mod]
-    v = Vocab.build(all_mods, {m: DEFAULT_MODALITY_VOCAB[m] for m in all_mods})
+    # num_quantizers can be scalar (applied to all mods) or dict {mod: int}
+    num_q_cfg = cfg["data"].get("num_quantizers", 1)
+    if isinstance(num_q_cfg, int):
+        num_q_map = {m: num_q_cfg for m in all_mods}
+    else:
+        num_q_map = dict(num_q_cfg)
+    v = Vocab.build(all_mods,
+                    {m: DEFAULT_MODALITY_CODEBOOK_SIZE[m] for m in all_mods},
+                    num_q_map)
     print(f"Vocab: {v}")
 
     train_ds = HEPDataset(

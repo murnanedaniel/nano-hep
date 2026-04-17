@@ -1,0 +1,43 @@
+# nano-hep pilot — 3-quantizer, 100k events, 5k steps
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: 100000
+  max_val_events: 2000
+
+model:
+  n_layer: 8
+  n_head: 8
+  n_embd: 512
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 3.0e-4
+  floor: 3.0e-5
+  warmup_steps: 200
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+training:
+  seed: 42
+  batch_size: 96        # slightly smaller than v1 (block_size is larger)
+  max_steps: 5000
+  log_every: 100
+  val_every: 500
+  ckpt_every: 2500
+  grad_clip: 1.0
+  num_workers: 2
+  compile: false
+  bf16: true
+  ar_eval_events: 128
+  out_dir: runs/pilot_q3
+  wandb: true
+  wandb_project: nano-hep
+  run_name: pilot-q3
