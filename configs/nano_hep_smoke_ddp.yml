@@ -1,0 +1,46 @@
+# DDP smoke — same as overnight but tiny, 200 steps
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: 20000
+  max_val_events: 500
+
+model:
+  n_layer: 6
+  n_head: 6
+  n_embd: 384
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 3.0e-4
+  floor: 3.0e-5
+  warmup_steps: 50
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: false
+
+training:
+  seed: 42
+  batch_size: 32
+  max_steps: 200
+  log_every: 20
+  val_every: 100
+  ckpt_every: 200
+  grad_clip: 1.0
+  num_workers: 2
+  compile: false
+  bf16: true
+  ar_eval_events: 32
+  out_dir: runs/smoke_ddp
+  wandb: false
+  wandb_project: nano-hep
+  run_name: smoke-ddp

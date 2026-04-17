@@ -1,0 +1,51 @@
+# nano-hep overnight DDP — 3-quantizer, 1M events, 4 nodes × 4 GPUs
+# Per-device batch 96; world size 16 → effective batch 1536.
+# 1M events / 1536 per step ≈ 650 steps/epoch.
+# 15k steps ≈ 23 epochs.
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: 1000000
+  max_val_events: 2000
+
+model:
+  # ~90M scale (same ballpark as 1-GPU config, tuned for DDP memory)
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 6.0e-4     # scaled up for larger effective batch (linear rule from 3e-4 @ bs 64)
+  floor: 6.0e-5
+  warmup_steps: 500
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: true
+  modality_dict_path: /global/cfs/cdirs/m4958/usr/danieltm/Side_Work/FoundationModels/HEP4M/data/experiments/HEP4M-pflow-pilot/pflow_pilot_10M_nocard/modality_dict.yml
+
+training:
+  seed: 42
+  batch_size: 96        # per GPU
+  max_steps: 15000      # ~23 epochs
+  log_every: 50
+  val_every: 500
+  ckpt_every: 2500
+  grad_clip: 1.0
+  num_workers: 4
+  compile: false
+  bf16: true
+  ar_eval_events: 256
+  out_dir: runs/overnight_1M_ddp
+  wandb: true
+  wandb_project: nano-hep
+  run_name: overnight-1M-ddp-4n4g

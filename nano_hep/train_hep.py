@@ -35,6 +35,33 @@ from .data import HEPDataset      # noqa: E402
 from .vocab import Vocab, DEFAULT_MODALITY_CODEBOOK_SIZE, DEFAULT_MODALITY_NUM_QUANTIZERS  # noqa: E402
 
 
+# ---- DDP setup ------------------------------------------------------------
+def _ddp_init():
+    """If launched via torchrun / slurm, init process group. Return
+    (is_ddp, rank, local_rank, world_size)."""
+    ws = int(os.environ.get("WORLD_SIZE", "1"))
+    if ws <= 1:
+        return False, 0, 0, 1
+    import torch.distributed as dist
+    # torchrun sets RANK, LOCAL_RANK, WORLD_SIZE. For slurm srun we map SLURM_* → torch env.
+    if "SLURM_PROCID" in os.environ and "RANK" not in os.environ:
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+        os.environ["LOCAL_RANK"] = os.environ.get("SLURM_LOCALID", "0")
+        # torchrun usually provides MASTER_ADDR/PORT; Slurm setups need one set externally
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    # Long timeout tolerates rank-0-only validation blocks (~minutes for AR decode)
+    from datetime import timedelta
+    dist.init_process_group(backend="nccl", init_method="env://",
+                            timeout=timedelta(minutes=120))
+    return True, rank, local_rank, ws
+
+
+def _is_main(rank: int) -> bool:
+    return rank == 0
+
+
 def _apply_loss_mask(y: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
     """Return targets with ignored positions set to -1 (nanoGPT's ignore_index).
     y, loss_mask are both (B, T) long."""
@@ -326,10 +353,14 @@ def main():
     out_dir = Path(cfg["training"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(cfg["training"].get("seed", 42))
+    is_ddp, rank, local_rank, world_size = _ddp_init()
+    main_rank = _is_main(rank)
+    torch.manual_seed(cfg["training"].get("seed", 42) + rank)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device_type = "cuda" if device == "cuda" else "cpu"
     dtype = torch.bfloat16 if cfg["training"].get("bf16", True) and device == "cuda" else torch.float32
+    if is_ddp and main_rank:
+        print(f"[DDP] world_size={world_size} rank={rank} local_rank={local_rank}", flush=True)
 
     # ---- data -----------------------------------------------------------------
     # Accept either `input_modality` (single, legacy) or `input_modalities` (list, new).
@@ -348,7 +379,8 @@ def main():
     v = Vocab.build(all_mods,
                     {m: DEFAULT_MODALITY_CODEBOOK_SIZE[m] for m in all_mods},
                     num_q_map)
-    print(f"Vocab: {v}")
+    if main_rank:
+        print(f"Vocab: {v}")
 
     train_ds = HEPDataset(
         tokenized_root=cfg["data"]["tokenized_root"],
@@ -366,11 +398,20 @@ def main():
         max_events=cfg["data"].get("max_val_events", 512),
         vocab=v,
     )
-    print(f"train events: {len(train_ds):,}  val events: {len(val_ds):,}")
+    if main_rank:
+        print(f"train events: {len(train_ds):,}  val events: {len(val_ds):,}")
 
+    train_sampler = None
+    if is_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size,
+                                           rank=rank, shuffle=True, drop_last=True)
     train_loader = DataLoader(train_ds, batch_size=cfg["training"]["batch_size"],
-                              shuffle=True, num_workers=cfg["training"].get("num_workers", 2),
+                              shuffle=(train_sampler is None),
+                              sampler=train_sampler,
+                              num_workers=cfg["training"].get("num_workers", 2),
                               pin_memory=True, drop_last=True)
+    # val runs only on rank 0 to keep eval logic simple (AR decode is not DDP-safe)
     val_loader = DataLoader(val_ds, batch_size=cfg["training"]["batch_size"],
                             shuffle=False, num_workers=cfg["training"].get("num_workers", 2),
                             pin_memory=True, drop_last=False)
@@ -387,21 +428,28 @@ def main():
     )
     model = GPT(gpt_cfg).to(device)
     if device == "cuda" and cfg["training"].get("compile", False):
-        print("torch.compile...")
+        if main_rank: print("torch.compile...")
         model = torch.compile(model)
 
-    optimizer = model.configure_optimizers(
+    # Optimizer configured on the raw model (needs param groups that reference modules)
+    raw_model = model
+    optimizer = raw_model.configure_optimizers(
         weight_decay=cfg["optim"]["weight_decay"],
         learning_rate=cfg["lr"]["peak"],
         betas=(cfg["optim"]["beta1"], cfg["optim"]["beta2"]),
         device_type=device_type,
     )
+
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False)
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
 
-    # ---- pflow metrics (optional) --------------------------------------------
+    # ---- pflow metrics (optional; only on rank 0) ----------------------------
     pflow = None
     pflow_cfg = cfg.get("pflow_metrics", {"enabled": False})
-    if pflow_cfg.get("enabled", False):
+    if pflow_cfg.get("enabled", False) and main_rank:
         from .pflow_metrics import PflowMetrics
         pflow = PflowMetrics(
             modality_dict_path=pflow_cfg["modality_dict_path"],
@@ -410,8 +458,8 @@ def main():
         )
         print(f"PflowMetrics enabled for output modality '{out_mod}'.")
 
-    # ---- wandb ---------------------------------------------------------------
-    use_wandb = cfg["training"].get("wandb", True)
+    # ---- wandb (rank 0 only) -------------------------------------------------
+    use_wandb = cfg["training"].get("wandb", True) and main_rank
     if use_wandb:
         import wandb
         wandb.init(project=cfg["training"].get("wandb_project", "nano-hep"),
@@ -426,14 +474,20 @@ def main():
     grad_clip = cfg["training"].get("grad_clip", 1.0)
 
     step = 0
+    epoch = 0
     t_last = time.time()
     best_val = float("inf")
     model.train()
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
     data_iter = iter(train_loader)
     while step < max_steps:
         try:
             x, y, m = next(data_iter)
         except StopIteration:
+            epoch += 1
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
             x, y, m = next(data_iter)
 
@@ -457,9 +511,9 @@ def main():
 
         step += 1
 
-        if step % log_every == 0:
+        if step % log_every == 0 and main_rank:
             now = time.time()
-            tps = (log_every * cfg["training"]["batch_size"] * (cfg["data"]["block_size"] - 1)) / (now - t_last)
+            tps = (log_every * cfg["training"]["batch_size"] * world_size * (cfg["data"]["block_size"] - 1)) / (now - t_last)
             n_loss_tokens = m.sum().item()
             msg = f"step {step}/{max_steps}  loss {loss.item():.4f}  lr {lr:.2e}  loss_tokens/batch {n_loss_tokens}  tok/s {tps:,.0f}"
             print(msg, flush=True)
@@ -468,11 +522,13 @@ def main():
                            "train/loss_tokens_per_batch": n_loss_tokens, "step": step})
             t_last = now
 
-        if step % val_every == 0 or step == max_steps:
-            val = estimate_val_loss(model, val_loader, device, v, max_batches=10)
+        if (step % val_every == 0 or step == max_steps) and main_rank:
+            # Run val on raw (un-DDP'd) model
+            _val_model = raw_model
+            val = estimate_val_loss(_val_model, val_loader, device, v, max_batches=10)
             ar_n_events = cfg["training"].get("ar_eval_events", 64)
             ar = autoregressive_eval_with_pflow(
-                model, val_ds, device, v,
+                _val_model, val_ds, device, v,
                 n_events=ar_n_events,
                 max_new_tokens=val_ds.block_size,
                 pflow=pflow,
@@ -518,7 +574,7 @@ def main():
             if val["val_loss"] < best_val:
                 best_val = val["val_loss"]
                 torch.save({
-                    "model": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
+                    "model": (raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model).state_dict(),
                     "config": cfg,
                     "gpt_config": gpt_cfg.__dict__,
                     "vocab": {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
@@ -529,12 +585,17 @@ def main():
                 }, out_dir / "best.ckpt")
                 print(f"  saved best.ckpt (val_loss={val['val_loss']:.4f})", flush=True)
 
-        if step % ckpt_every == 0:
-            torch.save({"model": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
+        if step % ckpt_every == 0 and main_rank:
+            torch.save({"model": (raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model).state_dict(),
                         "step": step, "gpt_config": gpt_cfg.__dict__},
                        out_dir / f"step{step:06d}.ckpt")
 
-    print("done.")
+    if main_rank:
+        print("done.")
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
