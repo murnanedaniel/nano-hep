@@ -87,6 +87,124 @@ def estimate_val_loss(model, val_loader, device, vocab, max_batches: int = 10) -
 
 
 @torch.no_grad()
+def autoregressive_eval_with_pflow(
+    model, val_ds, device, vocab,
+    n_events: int = 64, max_new_tokens: int = 64,
+    pflow=None,  # optional PflowMetrics instance
+) -> Dict[str, Any]:
+    """Like autoregressive_eval, but also collects per-event code triples
+    + positional tokens so pflow metrics can be computed via VQ-VAE decode.
+
+    If `pflow` is provided, returns the full pflow dict merged into the output.
+    Otherwise returns the same dict as autoregressive_eval.
+    """
+    # Call the standard AR eval first for token-level metrics.
+    out = autoregressive_eval(model, val_ds, device, vocab,
+                              n_events=n_events, max_new_tokens=max_new_tokens)
+    if pflow is None:
+        return out
+
+    # For pflow, we need to:
+    #  - gather predicted output-modality token triples per event from model AR decoding
+    #  - gather true output-modality tokens AND pos tokens
+    # Since AR decode doesn't emit positional tokens in our current sequence layout
+    # (we only include VQ codebook tokens, not gpos), we substitute true-gpos for pred-gpos.
+    # This isolates the VQ-codebook quality vs the positional prediction (which the model
+    # doesn't yet emit).
+    import awkward as ak
+    out_mod = val_ds.output_modality
+    num_q_out = vocab.num_quantizers[out_mod]
+    out_offset = vocab.offsets[out_mod]
+    V_out = vocab.codebook_sizes[out_mod]
+
+    # Re-run AR decode to collect per-event emitted tokens (small overhead for n_events<=128).
+    model.eval()
+    B = min(n_events, len(val_ds))
+    # Find max number of output elements across this subset (needed for padding)
+    max_N = 0
+    true_codes_list, true_pos_list = [], []
+    pred_codes_list, pred_mask_list = [], []
+    n_cb_true = val_ds.out_mm.n_codebooks
+    n_pos_true = val_ds.out_mm.n_pos_codebooks
+    for i in range(B):
+        # Real truth codes (all n_cb) + pos codes
+        a = int(val_ds.out_mm.offsets[i]); b = int(val_ds.out_mm.offsets[i + 1])
+        tc = np.asarray(val_ds.out_mm.data[a:b, :n_cb_true], dtype=np.int64)
+        tp = np.asarray(val_ds.out_mm.data[a:b, n_cb_true:n_cb_true + n_pos_true], dtype=np.int64)
+        true_codes_list.append(tc)
+        true_pos_list.append(tp)
+        # Run AR decode for pred tokens
+        seq = val_ds.build_sequence(i)
+        out_start_pos, _ = val_ds.output_region_slice(seq)
+        prefix_len = out_start_pos + 1
+        prefix = torch.from_numpy(seq[:prefix_len]).long().unsqueeze(0).to(device)
+        cur = prefix
+        max_len = min(val_ds.block_size, prefix_len + max_new_tokens)
+        emitted = []
+        while cur.shape[1] < max_len:
+            logits, _ = model(cur)
+            next_tok = int(logits[0, -1].argmax().item())
+            if next_tok == vocab.eos:
+                break
+            emitted.append(next_tok)
+            cur = torch.cat([cur, torch.tensor([[next_tok]], device=device, dtype=torch.long)], dim=1)
+        # Group emitted tokens into triples within the output modality range; drop partial trailing
+        out_tokens = [t for t in emitted if out_offset <= t < out_offset + num_q_out * V_out]
+        n_elems = len(out_tokens) // num_q_out
+        if n_elems == 0:
+            pc = np.zeros((0, num_q_out), dtype=np.int64)
+        else:
+            pc = vocab.decode_modality_triples(out_mod, np.array(out_tokens[: n_elems * num_q_out]))
+        # Clamp to codebook_size (just in case)
+        pc = np.clip(pc, 0, V_out - 1)
+        pred_codes_list.append(pc)
+        pred_mask_list.append(n_elems)
+        max_N = max(max_N, n_elems, tc.shape[0])
+
+    max_N = max(max_N, 1)
+    B = len(true_codes_list)
+    # pad everything to (B, max_N, ...)
+    pred_codes = np.zeros((B, max_N, num_q_out), dtype=np.int64)
+    pred_mask = np.zeros((B, max_N), dtype=bool)
+    true_codes = np.zeros((B, max_N, n_cb_true), dtype=np.int64)
+    true_pos = np.zeros((B, max_N, n_pos_true), dtype=np.int64)
+    true_mask = np.zeros((B, max_N), dtype=bool)
+    for i in range(B):
+        nt = true_codes_list[i].shape[0]
+        if nt > 0:
+            true_codes[i, :nt] = true_codes_list[i]
+            true_pos[i, :nt] = true_pos_list[i]
+            true_mask[i, :nt] = True
+        np_ = pred_codes_list[i].shape[0]
+        if np_ > 0:
+            # Pad/truncate pred codes to match VQ-VAE's expected quantizer count
+            n_q_fill = min(pred_codes_list[i].shape[1], n_cb_true)
+            pred_codes[i, :np_, :n_q_fill] = pred_codes_list[i][:, :n_q_fill]
+            pred_mask[i, :np_] = True
+
+    # Use TRUE pos codes for both — model doesn't yet emit gpos tokens. This gives
+    # a pflow number that reflects VQ codebook quality with "oracle" pos info.
+    # Once we extend to emit gpos tokens too, swap in pred-pos.
+    pred_pos = true_pos
+
+    # Pad pred_codes to full n_cb_true (missing quantizers get code 0, which is benign for VQ-VAE).
+    if pred_codes.shape[2] < n_cb_true:
+        extra = np.zeros((B, max_N, n_cb_true - pred_codes.shape[2]), dtype=np.int64)
+        pred_codes = np.concatenate([pred_codes, extra], axis=2)
+
+    pf_metrics = pflow.compute_metrics(
+        torch.from_numpy(pred_codes), torch.from_numpy(pred_pos), torch.from_numpy(pred_mask),
+        torch.from_numpy(true_codes), torch.from_numpy(true_pos), torch.from_numpy(true_mask),
+        outdir=None, ind_threshold=0.5,
+    )
+    model.train()
+    for k, v in pf_metrics.items():
+        if not str(k).startswith("_"):
+            out[f"pflow_{k}"] = v
+    return out
+
+
+@torch.no_grad()
 def autoregressive_eval(
     model,
     val_ds,
@@ -280,6 +398,18 @@ def main():
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
 
+    # ---- pflow metrics (optional) --------------------------------------------
+    pflow = None
+    pflow_cfg = cfg.get("pflow_metrics", {"enabled": False})
+    if pflow_cfg.get("enabled", False):
+        from .pflow_metrics import PflowMetrics
+        pflow = PflowMetrics(
+            modality_dict_path=pflow_cfg["modality_dict_path"],
+            output_modality=out_mod,
+            device=device,
+        )
+        print(f"PflowMetrics enabled for output modality '{out_mod}'.")
+
     # ---- wandb ---------------------------------------------------------------
     use_wandb = cfg["training"].get("wandb", True)
     if use_wandb:
@@ -341,9 +471,12 @@ def main():
         if step % val_every == 0 or step == max_steps:
             val = estimate_val_loss(model, val_loader, device, v, max_batches=10)
             ar_n_events = cfg["training"].get("ar_eval_events", 64)
-            ar = autoregressive_eval(model, val_ds, device, v,
-                                     n_events=ar_n_events,
-                                     max_new_tokens=val_ds.block_size)
+            ar = autoregressive_eval_with_pflow(
+                model, val_ds, device, v,
+                n_events=ar_n_events,
+                max_new_tokens=val_ds.block_size,
+                pflow=pflow,
+            )
             print(f"  val_loss {val['val_loss']:.4f}  tok_acc {val['val_token_accuracy']:.3f}  "
                   f"ar_card_acc {ar['ar_cardinality_acc']:.3f}  ar_card_mae {ar['ar_cardinality_mae']:.2f}  "
                   f"ar_tok_acc {ar['ar_token_accuracy']:.3f}  ar_n_pred {ar['ar_n_pred_mean']:.1f}±{ar['ar_n_pred_std']:.1f}  "
@@ -388,7 +521,7 @@ def main():
                     "model": (model._orig_mod if hasattr(model, "_orig_mod") else model).state_dict(),
                     "config": cfg,
                     "gpt_config": gpt_cfg.__dict__,
-                    "vocab": {"modalities": v.modalities, "vocab_sizes": v.vocab_sizes,
+                    "vocab": {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
                               "offsets": v.offsets, "mod_start": v.mod_start,
                               "eos": v.eos, "pad": v.pad, "total": v.total},
                     "step": step, "val_loss": val["val_loss"],

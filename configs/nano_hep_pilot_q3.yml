@@ -25,6 +25,10 @@ optim:
   beta1: 0.9
   beta2: 0.95
 
+pflow_metrics:
+  enabled: true
+  modality_dict_path: /global/cfs/cdirs/m4958/usr/danieltm/Side_Work/FoundationModels/HEP4M/data/experiments/HEP4M-pflow-pilot/pflow_pilot_10M_nocard/modality_dict.yml
+
 training:
   seed: 42
   batch_size: 96        # slightly smaller than v1 (block_size is larger)

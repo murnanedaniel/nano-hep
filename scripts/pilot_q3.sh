@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 REPO="/global/cfs/cdirs/m4958/usr/danieltm/Side_Work/FoundationModels/nano-hep"
-PYTHON="/global/homes/d/danieltm/.conda/envs/influencer/bin/python"
+PYTHON="/pscratch/sd/d/danieltm/envs/hep4m2/bin/python"
 cd "${REPO}"
 unset TMPDIR
 JOBID=${1:?Usage: $0 JOBID}
