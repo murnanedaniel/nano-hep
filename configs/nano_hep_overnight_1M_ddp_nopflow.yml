@@ -1,0 +1,48 @@
+# Insurance fallback: same as nano_hep_overnight_1M_ddp.yml but pflow_metrics
+# disabled (only val_loss + token accuracy + AR cardinality logged). Use if
+# the pflow import chain keeps failing and we need training data tonight.
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: 1000000
+  max_val_events: 2000
+
+model:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 6.0e-4
+  floor: 6.0e-5
+  warmup_steps: 500
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: false
+
+training:
+  seed: 42
+  batch_size: 96
+  max_steps: 15000
+  log_every: 50
+  val_every: 500
+  ckpt_every: 2500
+  grad_clip: 1.0
+  num_workers: 4
+  compile: false
+  bf16: true
+  ar_eval_events: 256
+  out_dir: runs/overnight_1M_ddp_nopflow
+  wandb: true
+  wandb_project: nano-hep
+  run_name: overnight-1M-ddp-4n4g-nopflow
