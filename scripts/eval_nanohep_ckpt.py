@@ -147,7 +147,7 @@ def main():
     metrics = pf.compute_metrics(
         torch.from_numpy(pred_codes), torch.from_numpy(pred_pos), torch.from_numpy(pred_mask),
         torch.from_numpy(true_codes), torch.from_numpy(true_pos), torch.from_numpy(true_mask),
-        outdir=Path(args.out_json).parent / f"{Path(args.ckpt).stem}_pflow_plots",
+        outdir=None,  # skip plotting (plot_jets API mismatch on twostep-smoke branch)
         ind_threshold=0.5,
     )
     clean = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)

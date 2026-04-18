@@ -63,10 +63,18 @@ def main():
     cfg_t["num_workers"] = 2
 
     print(f"Loading HEP4M Lightning from {ckpt_path}...")
-    lm = HEP4MLightning(
-        config_m=cfg_m, modality_dict=mod_dict, config_t=cfg_t,
-        wandb_logger=None, device=device,
-    )
+    # HEP4MLightning kwargs vary by branch: twostep-smoke takes `comet_logger`,
+    # logger-factory branches take `wandb_logger`. Try in that order.
+    try:
+        lm = HEP4MLightning(
+            config_m=cfg_m, modality_dict=mod_dict, config_t=cfg_t,
+            comet_logger=None, device=device,
+        )
+    except TypeError:
+        lm = HEP4MLightning(
+            config_m=cfg_m, modality_dict=mod_dict, config_t=cfg_t,
+            wandb_logger=None, device=device,
+        )
     lm.set_training_plan("fresh")
 
     # Load weights (skip Trainer — we just want forward passes)
@@ -113,7 +121,19 @@ def main():
             # returns a dict with per-modality predictions inside `pred_tokens_dict`
             # (see hep4m.py:334-388)
             try:
-                pred = lm.model.fast_forward(batch, sample_tokens=False, get_logits=True)
+                # twostep API: fast_forward(input_dict, output_modalities, q_mask_dict,
+                #                          get_logits=True, use_truth_cardinality=..., target_dict=...)
+                pred = lm.model.fast_forward(
+                    input_dict=batch["input"],
+                    output_modalities=["truthpart"],
+                    q_mask_dict=batch.get("q_mask_dict"),
+                    get_logits=True,
+                    use_truth_cardinality=True,
+                    target_dict=batch["target"],
+                )
+            except TypeError:
+                # fallback for older single-arg API
+                pred = lm.model.fast_forward(batch, get_logits=True)
             except Exception as e:
                 print(f"batch {bi}: fast_forward failed: {e}"); continue
 
@@ -183,10 +203,12 @@ def main():
 
     print(f"collected B={pred_codes.shape[0]} events, max_N={pred_codes.shape[1]}")
 
+    # outdir=None skips the plot-emit path (incompatible plot_jets API between
+    # twostep-smoke and the pflow_report we imported). Scalar metrics still computed.
     metrics = pf.compute_metrics(
         pred_codes, pred_pos, pred_mask,
         true_codes, true_pos, true_mask,
-        outdir=Path(args.out_json).parent / "hep4m_pflow_plots",
+        outdir=None,
         ind_threshold=0.45,
     )
     clean = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)

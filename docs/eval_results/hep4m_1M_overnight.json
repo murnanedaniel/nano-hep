@@ -1,0 +1,8 @@
+{
+  "n_events": 1984.0,
+  "mean_jet_pt_response": 3.810355966802493,
+  "median_jet_pt_response": 1.1726342989469973,
+  "std_jet_pt_response": 12.491008278351687,
+  "iqr_jet_pt_response": 0.6874452727066369,
+  "mean_reco_cardinality_at_threshold": 13.774193548387096
+}
