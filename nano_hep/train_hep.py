@@ -344,6 +344,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--out_dir", default=None, help="override cfg.training.out_dir")
+    ap.add_argument("--resume_from", default=None,
+                    help="path to last.ckpt (or an out_dir to auto-resolve); when set, "
+                         "restores model + optimizer + step + wandb run_id so a SLURM-"
+                         "timeout resume continues the same wandb run cleanly.")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -446,6 +450,38 @@ def main():
                     find_unused_parameters=False)
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
 
+    # ---- resume from checkpoint (before wandb.init so we can reuse run_id) --
+    resume_state = None
+    resume_wandb_id = None
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+        if resume_path.is_dir():
+            resume_path = resume_path / "last.ckpt"
+        if resume_path.exists():
+            if main_rank:
+                print(f"[resume] loading {resume_path}", flush=True)
+            resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+            # Model state — tolerate DDP-wrapped vs raw
+            msd = resume_state["model"]
+            try:
+                raw_model.load_state_dict(msd)
+            except Exception:
+                # strip module. prefix if present
+                msd = {k.replace("module.", "", 1) if k.startswith("module.") else k: v
+                       for k, v in msd.items()}
+                raw_model.load_state_dict(msd)
+            if "optimizer" in resume_state:
+                optimizer.load_state_dict(resume_state["optimizer"])
+            if "scaler" in resume_state and resume_state["scaler"] is not None:
+                try:
+                    scaler.load_state_dict(resume_state["scaler"])
+                except Exception:
+                    pass
+            resume_wandb_id = resume_state.get("wandb_run_id")
+        else:
+            if main_rank:
+                print(f"[resume] no checkpoint at {resume_path}; starting fresh", flush=True)
+
     # ---- pflow metrics (optional; only on rank 0) ----------------------------
     pflow = None
     pflow_cfg = cfg.get("pflow_metrics", {"enabled": False})
@@ -462,9 +498,26 @@ def main():
     use_wandb = cfg["training"].get("wandb", True) and main_rank
     if use_wandb:
         import wandb
-        wandb.init(project=cfg["training"].get("wandb_project", "nano-hep"),
-                   name=cfg["training"].get("run_name", out_dir.name),
-                   config=cfg, dir=str(out_dir))
+        wandb_kwargs = dict(
+            project=cfg["training"].get("wandb_project", "nano-hep"),
+            name=cfg["training"].get("run_name", out_dir.name),
+            config=cfg,
+            dir=str(out_dir),
+        )
+        # On resume, reuse the same run id + allow wandb to append to the existing
+        # cloud run so step counters stay continuous across SLURM-timeout restarts.
+        if resume_wandb_id:
+            wandb_kwargs["id"] = resume_wandb_id
+            wandb_kwargs["resume"] = "allow"
+        wandb.init(**wandb_kwargs)
+        # Make trainer step the default x-axis so all charts are continuous across
+        # resumes (wandb's per-run _step resets to 0 each init; our "step" metric
+        # is the monotonic global step we log in train/ + val/).
+        try:
+            wandb.define_metric("step")
+            wandb.define_metric("*", step_metric="step")
+        except Exception as _e:
+            print(f"[wandb] define_metric failed (non-fatal): {_e}", flush=True)
 
     # ---- train loop -----------------------------------------------------------
     max_steps = cfg["training"]["max_steps"]
@@ -475,8 +528,15 @@ def main():
 
     step = 0
     epoch = 0
-    t_last = time.time()
     best_val = float("inf")
+    if resume_state is not None:
+        step = int(resume_state.get("step", 0))
+        epoch = int(resume_state.get("epoch", 0))
+        best_val = float(resume_state.get("best_val", best_val))
+        if main_rank:
+            print(f"[resume] continuing from step={step} epoch={epoch} best_val={best_val:.4f}",
+                  flush=True)
+    t_last = time.time()
     model.train()
     if train_sampler is not None:
         train_sampler.set_epoch(epoch)
@@ -586,19 +646,42 @@ def main():
                 except Exception as e:
                     print(f"  (skipped cardinality plot: {e})")
                 wandb.log(log_dict)
-            if val["val_loss"] < best_val:
-                best_val = val["val_loss"]
-                torch.save({
-                    "model": (raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model).state_dict(),
+            # Always save last.ckpt (with optimizer + run_id) so chain resume works.
+            if main_rank:
+                _model_sd = (raw_model._orig_mod if hasattr(raw_model, "_orig_mod")
+                             else raw_model).state_dict()
+                _vocab = {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
+                          "num_quantizers": v.num_quantizers,
+                          "offsets": v.offsets, "mod_start": v.mod_start,
+                          "eos": v.eos, "pad": v.pad, "total": v.total}
+                _run_id = None
+                if use_wandb:
+                    try:
+                        _run_id = wandb.run.id
+                    except Exception:
+                        pass
+                _full_state = {
+                    "model": _model_sd,
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict() if scaler is not None else None,
                     "config": cfg,
                     "gpt_config": gpt_cfg.__dict__,
-                    "vocab": {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
-                              "num_quantizers": v.num_quantizers,
-                              "offsets": v.offsets, "mod_start": v.mod_start,
-                              "eos": v.eos, "pad": v.pad, "total": v.total},
-                    "step": step, "val_loss": val["val_loss"],
-                }, out_dir / "best.ckpt")
-                print(f"  saved best.ckpt (val_loss={val['val_loss']:.4f})", flush=True)
+                    "vocab": _vocab,
+                    "step": step, "epoch": epoch, "best_val": best_val,
+                    "val_loss": val["val_loss"],
+                    "wandb_run_id": _run_id,
+                }
+                torch.save(_full_state, out_dir / "last.ckpt")
+
+                if val["val_loss"] < best_val:
+                    best_val = val["val_loss"]
+                    # best.ckpt: minimal (model + config + vocab), matches previous format
+                    torch.save({
+                        "model": _model_sd,
+                        "config": cfg, "gpt_config": gpt_cfg.__dict__, "vocab": _vocab,
+                        "step": step, "val_loss": val["val_loss"],
+                    }, out_dir / "best.ckpt")
+                    print(f"  saved best.ckpt (val_loss={val['val_loss']:.4f})", flush=True)
 
         if step % ckpt_every == 0 and main_rank:
             torch.save({"model": (raw_model._orig_mod if hasattr(raw_model, "_orig_mod") else raw_model).state_dict(),
