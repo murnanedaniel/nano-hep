@@ -1,0 +1,59 @@
+# nano-hep 89M DDP — apples-to-apples with HEP4M pflow_gold run.
+# 4 nodes × 4 A100-80GB = 16 GPUs. Same data as HEP4M (Tokenized_89M).
+#
+# Batch accounting:
+#   Per-device batch 96, world size 16 → effective batch 1536 events/step.
+#   89M events / 1536 ≈ 58k steps/epoch.
+#   max_steps 500k → ~8.6 epochs of 89M (vs HEP4M which needs ~30-50 epochs to
+#   converge; nano-hep trains slower wall-clock so we give it a long budget
+#   and rely on early convergence signal rather than stepping through all epochs).
+#
+# Training wall-time estimate at ~2-3 steps/sec: 500k steps / 2.5 sps ≈ 55h
+# interactive wall time — runs across ~14 chained 4h allocs.
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized_89M
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 320
+  max_train_events: -1      # use all ~89M
+  max_val_events: 10000     # match HEP4M's reduce_ds_val; bigger val set for stable metric
+
+model:
+  # Keep 90M scale for apples-to-apples parameter count with the overnight run
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 6.0e-4
+  floor: 6.0e-5
+  warmup_steps: 500
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: true
+  modality_dict_path: /global/cfs/cdirs/m4958/usr/danieltm/Side_Work/FoundationModels/HEP4M/data/experiments/HEP4M-pflow-pilot/pflow_pilot_10M_nocard/modality_dict.yml
+
+training:
+  seed: 42
+  batch_size: 96
+  max_steps: 500000
+  log_every: 100
+  val_every: 2000
+  ckpt_every: 10000
+  grad_clip: 1.0
+  num_workers: 4
+  compile: false
+  bf16: true
+  ar_eval_events: 256
+  out_dir: runs/nano_hep_89M_ddp
+  wandb: true
+  wandb_project: nano-hep
+  run_name: nano-hep-89M-ddp-4n4g
