@@ -226,12 +226,21 @@ def autoregressive_eval_with_pflow(
             pred_pos  [i, :np_, :n_qp] = pred_pos_list[i][:, :n_qp]
             pred_mask [i, :np_] = True
 
+    # Tempdir outdir so pflow_report.run_report_from_arrays writes jet_response.png,
+    # marginals.png, cardinality.png — caller uploads them as wandb.Image (mirrors
+    # HEP4M's pflow_eval logging).
+    import tempfile as _tempfile
+    _outdir = _tempfile.mkdtemp(prefix="nanohep_pflow_eval_")
     pf_metrics = pflow.compute_metrics(
         torch.from_numpy(pred_codes), torch.from_numpy(pred_pos), torch.from_numpy(pred_mask),
         torch.from_numpy(true_codes), torch.from_numpy(true_pos), torch.from_numpy(true_mask),
-        outdir=None, ind_threshold=0.5,
+        outdir=_outdir, ind_threshold=0.5,
     )
     model.train()
+    # Preserve the raw histograms + jet table + outdir for caller (wandb upload).
+    out["_pflow_outdir"] = _outdir
+    out["_pflow_histograms"] = pf_metrics.get("_histograms", {})
+    out["_pflow_jet_table"] = pf_metrics.get("_jet_table", {})
     for k, v in pf_metrics.items():
         if not str(k).startswith("_"):
             out[f"pflow_{k}"] = v
@@ -617,7 +626,14 @@ def main():
                     "step": step,
                 }
                 for k, vv in ar.items():
-                    if not k.startswith("_"):
+                    if k.startswith("_"):
+                        continue
+                    # pflow_* keys use underscore-prefix to match HEP4M's
+                    # val_pflow_* naming — enables direct side-by-side wandb
+                    # comparison across the two projects.
+                    if k.startswith("pflow_"):
+                        log_dict[f"val_{k}"] = vv
+                    else:
                         log_dict[f"val/{k}"] = vv
                 # Apples-to-apples aliases matching HEP4M's val/cardinality_* keys.
                 # HEP4M has no "ar_" equivalent; share unprefixed names for cross-run plots.
@@ -656,7 +672,56 @@ def main():
                     plt.close(fig)
                 except Exception as e:
                     print(f"  (skipped cardinality plot: {e})")
+
+                # pflow jet-level plots (jet_response / marginals / cardinality) +
+                # residual histograms + jet table — mirrors HEP4M's pflow_eval
+                # upload path so both wandb projects show identical media.
+                _pflow_outdir     = ar.pop("_pflow_outdir", None)
+                _pflow_histograms = ar.pop("_pflow_histograms", {}) or {}
+                _pflow_jet_table  = ar.pop("_pflow_jet_table", {}) or {}
+                if _pflow_outdir:
+                    try:
+                        from PIL import Image as _PILImage
+                        import os as _os2
+                        # Keys match HEP4M's hep4m_lightning.py pflow_eval upload.
+                        for _name, _fname in [
+                            ("val_pflow_jet_response",  "jet_response.png"),
+                            ("val_pflow_marginals",     "marginals.png"),
+                            ("val_pflow_cardinality",   "cardinality.png"),
+                        ]:
+                            _path = _os2.path.join(_pflow_outdir, _fname)
+                            if _os2.path.isfile(_path):
+                                log_dict[_name] = wandb.Image(_PILImage.open(_path).copy())
+                    except Exception as e:
+                        print(f"  (skipped pflow plot upload: {e})")
+                # Residual / marginal histograms (interactive in wandb UI).
+                for _k, _pair in _pflow_histograms.items():
+                    try:
+                        counts, edges = _pair
+                        log_dict[f"val_pflow_hist_{_k}"] = wandb.Histogram(
+                            np_histogram=(counts, edges))
+                    except Exception as e:
+                        print(f"  (skipped hist {_k}: {e})")
+                # Jet-level table.
+                if _pflow_jet_table:
+                    try:
+                        cols = list(_pflow_jet_table.keys())
+                        log_dict["val_pflow_jets"] = wandb.Table(
+                            columns=cols,
+                            data=list(zip(*(_pflow_jet_table[c].tolist() for c in cols))),
+                        )
+                    except Exception as e:
+                        print(f"  (skipped jet table: {e})")
+
                 wandb.log(log_dict)
+
+                # Clean up tempdir
+                if _pflow_outdir:
+                    try:
+                        import shutil as _shutil
+                        _shutil.rmtree(_pflow_outdir, ignore_errors=True)
+                    except Exception:
+                        pass
             # Always save last.ckpt (with optimizer + run_id) so chain resume works.
             if main_rank:
                 _model_sd = (raw_model._orig_mod if hasattr(raw_model, "_orig_mod")
