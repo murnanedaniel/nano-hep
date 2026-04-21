@@ -548,6 +548,21 @@ def main():
                 for k, vv in ar.items():
                     if not k.startswith("_"):
                         log_dict[f"val/{k}"] = vv
+                # Apples-to-apples aliases matching HEP4M's val/cardinality_* keys.
+                # HEP4M has no "ar_" equivalent; share unprefixed names for cross-run plots.
+                if "ar_cardinality_acc" in ar:
+                    log_dict["val/cardinality_acc"]  = ar["ar_cardinality_acc"]
+                    log_dict["val/cardinality_mae"]  = ar["ar_cardinality_mae"]
+                    log_dict["val/n_pred_mean"]      = ar["ar_n_pred_mean"]
+                    log_dict["val/n_pred_std"]       = ar["ar_n_pred_std"]
+                    log_dict["val/n_true_mean"]      = ar["ar_n_true_mean"]
+                    log_dict["val/n_true_std"]       = ar["ar_n_true_std"]
+                    # bias + std of residual (nano-hep didn't have these; add for parity)
+                    _nt = ar.get("_n_true_arr"); _np_arr = ar.get("_n_pred_arr")
+                    if _nt is not None and _np_arr is not None and len(_nt) > 1:
+                        _r = _np_arr - _nt
+                        log_dict["val/cardinality_bias"] = float(_r.mean())
+                        log_dict["val/cardinality_std"]  = float(_r.std())
                 # Cardinality scatter plot (wandb Image) every val
                 try:
                     import matplotlib
