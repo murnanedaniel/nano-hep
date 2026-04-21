@@ -119,11 +119,18 @@ def autoregressive_eval_with_pflow(
     n_events: int = 64, max_new_tokens: int = 64,
     pflow=None,  # optional PflowMetrics instance
 ) -> Dict[str, Any]:
-    """Like autoregressive_eval, but also collects per-event code triples
-    + positional tokens so pflow metrics can be computed via VQ-VAE decode.
+    """Like autoregressive_eval, but also collects per-event (content, pos)
+    code pairs so pflow metrics can be computed via VQ-VAE + PosTokenizer
+    decode.
 
-    If `pflow` is provided, returns the full pflow dict merged into the output.
-    Otherwise returns the same dict as autoregressive_eval.
+    AR stream emits 6 tokens per output element (content triple + pos triple,
+    content-first). We greedy-generate to EOS or block_size, then parse the
+    output region into strict 6-token groups. Any group with an out-of-range
+    token aborts the parser and discards the tail — so a poorly-calibrated
+    model simply yields fewer complete elements (honest behavior, no
+    truth-pos oracle).
+
+    If `pflow` is provided, returns the full pflow dict merged into `out`.
     """
     # Call the standard AR eval first for token-level metrics.
     out = autoregressive_eval(model, val_ds, device, vocab,
@@ -131,36 +138,32 @@ def autoregressive_eval_with_pflow(
     if pflow is None:
         return out
 
-    # For pflow, we need to:
-    #  - gather predicted output-modality token triples per event from model AR decoding
-    #  - gather true output-modality tokens AND pos tokens
-    # Since AR decode doesn't emit positional tokens in our current sequence layout
-    # (we only include VQ codebook tokens, not gpos), we substitute true-gpos for pred-gpos.
-    # This isolates the VQ-codebook quality vs the positional prediction (which the model
-    # doesn't yet emit).
-    import awkward as ak
     out_mod = val_ds.output_modality
-    num_q_out = vocab.num_quantizers[out_mod]
-    out_offset = vocab.offsets[out_mod]
-    V_out = vocab.codebook_sizes[out_mod]
+    nq_c    = vocab.num_quantizers[out_mod]
+    nq_p    = vocab.num_q_pos[out_mod]
+    GROUP   = nq_c + nq_p
+    V_c     = vocab.codebook_sizes[out_mod]
+    V_p     = vocab.pos_codebook_sizes[out_mod]
+    content_lo = vocab.offsets[out_mod];     content_hi = content_lo + nq_c * V_c
+    pos_lo     = vocab.pos_offsets[out_mod]; pos_hi     = pos_lo     + nq_p * V_p
 
-    # Re-run AR decode to collect per-event emitted tokens (small overhead for n_events<=128).
+    # Re-run AR decode to collect per-event emitted tokens.
     model.eval()
     B = min(n_events, len(val_ds))
-    # Find max number of output elements across this subset (needed for padding)
     max_N = 0
     true_codes_list, true_pos_list = [], []
-    pred_codes_list, pred_mask_list = [], []
+    pred_codes_list, pred_pos_list = [], []
     n_cb_true = val_ds.out_mm.n_codebooks
     n_pos_true = val_ds.out_mm.n_pos_codebooks
     for i in range(B):
-        # Real truth codes (all n_cb) + pos codes
+        # --- truth (content + pos) ---
         a = int(val_ds.out_mm.offsets[i]); b = int(val_ds.out_mm.offsets[i + 1])
         tc = np.asarray(val_ds.out_mm.data[a:b, :n_cb_true], dtype=np.int64)
         tp = np.asarray(val_ds.out_mm.data[a:b, n_cb_true:n_cb_true + n_pos_true], dtype=np.int64)
         true_codes_list.append(tc)
         true_pos_list.append(tp)
-        # Run AR decode for pred tokens
+
+        # --- AR decode ---
         seq = val_ds.build_sequence(i)
         out_start_pos, _ = val_ds.output_region_slice(seq)
         prefix_len = out_start_pos + 1
@@ -175,49 +178,53 @@ def autoregressive_eval_with_pflow(
                 break
             emitted.append(next_tok)
             cur = torch.cat([cur, torch.tensor([[next_tok]], device=device, dtype=torch.long)], dim=1)
-        # Group emitted tokens into triples within the output modality range; drop partial trailing
-        out_tokens = [t for t in emitted if out_offset <= t < out_offset + num_q_out * V_out]
-        n_elems = len(out_tokens) // num_q_out
-        if n_elems == 0:
-            pc = np.zeros((0, num_q_out), dtype=np.int64)
+
+        # --- strict group parse: first nq_c tokens in content range, next nq_p in pos range ---
+        pc_rows = []
+        pp_rows = []
+        j = 0
+        while j + GROUP <= len(emitted):
+            content_ok = all(content_lo <= emitted[j + k] < content_hi for k in range(nq_c))
+            pos_ok     = all(pos_lo     <= emitted[j + k] < pos_hi     for k in range(nq_c, GROUP))
+            if not (content_ok and pos_ok):
+                break  # abandon tail on any range violation
+            group_ids = np.array(emitted[j : j + GROUP], dtype=np.int64)
+            c_local, p_local = vocab.decode_element_triples_with_pos(out_mod, group_ids)
+            pc_rows.append(c_local[0])
+            pp_rows.append(p_local[0])
+            j += GROUP
+        if pc_rows:
+            pc = np.stack(pc_rows, axis=0)  # (n, nq_c)
+            pp = np.stack(pp_rows, axis=0)  # (n, nq_p)
         else:
-            pc = vocab.decode_modality_triples(out_mod, np.array(out_tokens[: n_elems * num_q_out]))
-        # Clamp to codebook_size (just in case)
-        pc = np.clip(pc, 0, V_out - 1)
+            pc = np.zeros((0, nq_c), dtype=np.int64)
+            pp = np.zeros((0, nq_p), dtype=np.int64)
         pred_codes_list.append(pc)
-        pred_mask_list.append(n_elems)
-        max_N = max(max_N, n_elems, tc.shape[0])
+        pred_pos_list.append(pp)
+        max_N = max(max_N, pc.shape[0], tc.shape[0])
 
     max_N = max(max_N, 1)
     B = len(true_codes_list)
-    # pad everything to (B, max_N, ...)
-    pred_codes = np.zeros((B, max_N, num_q_out), dtype=np.int64)
-    pred_mask = np.zeros((B, max_N), dtype=bool)
+    # Pad to (B, max_N, n_cb_true) for content and (B, max_N, n_pos_true) for pos.
+    pred_codes = np.zeros((B, max_N, n_cb_true), dtype=np.int64)
+    pred_pos   = np.zeros((B, max_N, n_pos_true), dtype=np.int64)
+    pred_mask  = np.zeros((B, max_N), dtype=bool)
     true_codes = np.zeros((B, max_N, n_cb_true), dtype=np.int64)
-    true_pos = np.zeros((B, max_N, n_pos_true), dtype=np.int64)
-    true_mask = np.zeros((B, max_N), dtype=bool)
+    true_pos   = np.zeros((B, max_N, n_pos_true), dtype=np.int64)
+    true_mask  = np.zeros((B, max_N), dtype=bool)
     for i in range(B):
         nt = true_codes_list[i].shape[0]
         if nt > 0:
             true_codes[i, :nt] = true_codes_list[i]
-            true_pos[i, :nt] = true_pos_list[i]
-            true_mask[i, :nt] = True
+            true_pos  [i, :nt] = true_pos_list[i]
+            true_mask [i, :nt] = True
         np_ = pred_codes_list[i].shape[0]
         if np_ > 0:
-            # Pad/truncate pred codes to match VQ-VAE's expected quantizer count
-            n_q_fill = min(pred_codes_list[i].shape[1], n_cb_true)
-            pred_codes[i, :np_, :n_q_fill] = pred_codes_list[i][:, :n_q_fill]
-            pred_mask[i, :np_] = True
-
-    # Use TRUE pos codes for both — model doesn't yet emit gpos tokens. This gives
-    # a pflow number that reflects VQ codebook quality with "oracle" pos info.
-    # Once we extend to emit gpos tokens too, swap in pred-pos.
-    pred_pos = true_pos
-
-    # Pad pred_codes to full n_cb_true (missing quantizers get code 0, which is benign for VQ-VAE).
-    if pred_codes.shape[2] < n_cb_true:
-        extra = np.zeros((B, max_N, n_cb_true - pred_codes.shape[2]), dtype=np.int64)
-        pred_codes = np.concatenate([pred_codes, extra], axis=2)
+            n_qc = min(pred_codes_list[i].shape[1], n_cb_true)
+            n_qp = min(pred_pos_list[i].shape[1],   n_pos_true)
+            pred_codes[i, :np_, :n_qc] = pred_codes_list[i][:, :n_qc]
+            pred_pos  [i, :np_, :n_qp] = pred_pos_list[i][:, :n_qp]
+            pred_mask [i, :np_] = True
 
     pf_metrics = pflow.compute_metrics(
         torch.from_numpy(pred_codes), torch.from_numpy(pred_pos), torch.from_numpy(pred_mask),
@@ -243,13 +250,15 @@ def autoregressive_eval(
     """Run AR generation on a small val subset. For each event:
       1. Feed the prefix up through MOD_START[output] and generate tokens greedily.
       2. Stop at EOS or max_new_tokens.
-      3. Compute predicted cardinality = count of output-modality tokens emitted
-         before EOS.
+      3. Cardinality = (count of output-modality tokens emitted before EOS) //
+         GROUP, where GROUP = num_q_content + num_q_pos = 6. A token is
+         considered "output-modality" if it falls in either the content range
+         or the pos range for the output modality.
 
     Reports:
       ar_cardinality_acc  — fraction of events where pred cardinality == true.
       ar_cardinality_mae  — mean |pred − true|.
-      ar_n_pred_mean/std  — cardinality-pred stats.
+      ar_n_pred_mean/std  — cardinality-pred stats (#elements = tokens // 6).
       ar_n_true_mean/std  — cardinality-true stats.
       ar_eos_position_error — mean |predicted EOS pos − true EOS pos|.
       ar_token_accuracy   — accuracy of generated tokens vs teacher tokens,
@@ -258,11 +267,13 @@ def autoregressive_eval(
     """
     model.eval()
     out_mod = val_ds.output_modality
-    out_offset = vocab.offsets[out_mod]
-    num_q_out = vocab.num_quantizers[out_mod]
-    V_out = vocab.codebook_sizes[out_mod]
-    out_block_size = num_q_out * V_out  # total width of modality block
-    out_token_range = (out_offset, out_offset + out_block_size)
+    nq_c    = vocab.num_quantizers[out_mod]
+    nq_p    = vocab.num_q_pos[out_mod]
+    GROUP   = nq_c + nq_p                       # tokens per element (content + pos)
+    V_c     = vocab.codebook_sizes[out_mod]
+    V_p     = vocab.pos_codebook_sizes[out_mod]
+    content_lo = vocab.offsets[out_mod];     content_hi = content_lo + nq_c * V_c
+    pos_lo     = vocab.pos_offsets[out_mod]; pos_hi     = pos_lo     + nq_p * V_p
     eos_id = vocab.eos
     pad_id = vocab.pad
     mod_start_out = vocab.mod_start[out_mod]
@@ -273,14 +284,14 @@ def autoregressive_eval(
         seq = val_ds.build_sequence(i)  # (block_size,) int64
         out_start_pos, true_eos_pos = val_ds.output_region_slice(seq)
         n_true_tokens = true_eos_pos - (out_start_pos + 1)  # tokens between MOD_START[out] and EOS
-        n_true = n_true_tokens // num_q_out   # number of elements (particles)
+        n_true = n_true_tokens // GROUP   # number of elements (particles); 6 tokens each
         # Prefix: everything up through MOD_START[out] (inclusive)
         prefix_len = out_start_pos + 1
         prefix = torch.from_numpy(seq[:prefix_len]).long().unsqueeze(0).to(device)
 
-        # Autoregressive generation
+        # Autoregressive generation (greedy argmax; matches HEP4M pflow_eval top_k=1).
         cur = prefix
-        n_pred_tokens = 0
+        n_pred_out_tokens = 0  # any token in content or pos range of out_mod
         emitted = []
         max_len = min(val_ds.block_size, prefix_len + max_new_tokens)
         ended = False
@@ -292,10 +303,10 @@ def autoregressive_eval(
             if next_tok == eos_id:
                 ended = True
                 break
-            # Count output-modality tokens
-            if out_token_range[0] <= next_tok < out_token_range[1]:
-                n_pred_tokens += 1
-        n_pred = n_pred_tokens // num_q_out  # elements
+            # Count output-modality tokens (content OR pos — both belong to the output element)
+            if (content_lo <= next_tok < content_hi) or (pos_lo <= next_tok < pos_hi):
+                n_pred_out_tokens += 1
+        n_pred = n_pred_out_tokens // GROUP  # complete 6-token groups = elements
 
         # Predicted EOS position = len(prefix) + len(emitted) - 1 (inclusive of the EOS if ended)
         if ended:
@@ -652,7 +663,10 @@ def main():
                              else raw_model).state_dict()
                 _vocab = {"modalities": v.modalities, "codebook_sizes": v.codebook_sizes,
                           "num_quantizers": v.num_quantizers,
-                          "offsets": v.offsets, "mod_start": v.mod_start,
+                          "pos_codebook_sizes": v.pos_codebook_sizes,
+                          "num_q_pos": v.num_q_pos,
+                          "offsets": v.offsets, "pos_offsets": v.pos_offsets,
+                          "mod_start": v.mod_start,
                           "eos": v.eos, "pad": v.pad, "total": v.total}
                 _run_id = None
                 if use_wandb:

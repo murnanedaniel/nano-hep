@@ -1,21 +1,22 @@
-# nano-hep 89M DDP — apples-to-apples with HEP4M pflow_gold run.
-# 4 nodes × 4 A100-80GB = 16 GPUs. Same data as HEP4M (Tokenized_89M).
+# nano-hep 89M DDP — REAL apples-to-apples with HEP4M pflow_gold (content+pos AR,
+# no truth-pos oracle). 4 nodes × 4 A100-80GB = 16 GPUs.
+#
+# Per-element token width = num_q_content + num_q_pos = 6. Each output particle
+# emits 3 content tokens (VQ codes q0/q1/q2) then 3 pos tokens (PosTokenizer
+# q0/q1/q2 for eta/cos_phi/sin_phi). Block grew from 320 → 512 to fit inputs
+# (~60 trk + ~10 topo elements × 6 tokens) + ~8 truthpart elements × 6 + pad.
 #
 # Batch accounting:
-#   Per-device batch 96, world size 16 → effective batch 1536 events/step.
-#   89M events / 1536 ≈ 58k steps/epoch.
-#   max_steps 500k → ~8.6 epochs of 89M (vs HEP4M which needs ~30-50 epochs to
-#   converge; nano-hep trains slower wall-clock so we give it a long budget
-#   and rely on early convergence signal rather than stepping through all epochs).
-#
-# Training wall-time estimate at ~2-3 steps/sec: 500k steps / 2.5 sps ≈ 55h
-# interactive wall time — runs across ~14 chained 4h allocs.
+#   Per-device batch 64, world size 16 → effective batch 1024 events/step.
+#   89M events / 1024 ≈ 87k steps/epoch. max_steps 500k ≈ 5.7 epochs.
+#   At ~2-3 steps/sec (slower than oracle-pos run due to longer T), 500k steps
+#   ≈ 55-70h interactive wall — ~14-18 chained 4h allocs.
 data:
   tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized_89M
   input_modalities: [track, topo]
   output_modality: truthpart
   num_quantizers: 3
-  block_size: 320
+  block_size: 512
   max_train_events: -1      # use all ~89M
   max_val_events: 10000     # match HEP4M's reduce_ds_val; bigger val set for stable metric
 
@@ -43,7 +44,7 @@ pflow_metrics:
 
 training:
   seed: 42
-  batch_size: 96
+  batch_size: 64           # halved from 96 to keep memory budget at block_size=512
   max_steps: 500000
   log_every: 100
   val_every: 2000
@@ -56,4 +57,4 @@ training:
   out_dir: runs/nano_hep_89M_ddp
   wandb: true
   wandb_project: nano-hep
-  run_name: nano-hep-89M-ddp-4n4g
+  run_name: nano-hep-89M-ddp-4n4g-gpos

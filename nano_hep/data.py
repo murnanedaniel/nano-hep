@@ -81,12 +81,28 @@ class ModalityMemmap:
         return col0
 
     def event_codes(self, idx: int, num_q: int) -> np.ndarray:
-        """Return the first `num_q` codebook columns for event `idx`, shape (n_elems, num_q) int64."""
+        """Return the first `num_q` CONTENT codebook columns for event `idx`,
+        shape (n_elems, num_q) int64. Columns [0, num_q)."""
         a = int(self.offsets[idx]); b = int(self.offsets[idx + 1])
         if b == a:
             return np.empty((0, num_q), dtype=np.int64)
         assert num_q <= self.n_codebooks, f"requested num_q={num_q} > n_codebooks={self.n_codebooks}"
         cols = self.data[a:b, :num_q].astype(np.int64)
+        return cols
+
+    def event_pos_codes(self, idx: int, num_q_pos: int) -> np.ndarray:
+        """Return the first `num_q_pos` POS codebook columns for event `idx`,
+        shape (n_elems, num_q_pos) int64. Columns
+        [n_codebooks, n_codebooks + num_q_pos) — sits AFTER the content
+        block in the memmap data array."""
+        a = int(self.offsets[idx]); b = int(self.offsets[idx + 1])
+        if b == a:
+            return np.empty((0, num_q_pos), dtype=np.int64)
+        assert num_q_pos <= self.n_pos_codebooks, \
+            f"requested num_q_pos={num_q_pos} > n_pos_codebooks={self.n_pos_codebooks}"
+        lo = self.n_codebooks
+        hi = self.n_codebooks + num_q_pos
+        cols = self.data[a:b, lo:hi].astype(np.int64)
         return cols
 
 
@@ -111,6 +127,8 @@ class HEPDataset(Dataset):
         max_events: int = -1,
         vocab: Vocab | None = None,
         num_quantizers: "dict | int" = 1,
+        num_q_pos: "dict | int" = 3,
+        pos_codebook_size: int = 1024,
     ):
         self.split = split
         self.input_modalities = list(input_modalities)
@@ -131,13 +149,21 @@ class HEPDataset(Dataset):
                 num_q_map = {m: num_quantizers for m in all_mods}
             else:
                 num_q_map = dict(num_quantizers)
+            if isinstance(num_q_pos, int):
+                num_q_pos_map = {m: num_q_pos for m in all_mods}
+            else:
+                num_q_pos_map = dict(num_q_pos)
+            pos_cb_sizes = {m: pos_codebook_size for m in all_mods}
             vocab = Vocab.build(
                 all_mods,
                 {m: DEFAULT_MODALITY_CODEBOOK_SIZE[m] for m in all_mods},
                 num_q_map,
+                pos_codebook_sizes=pos_cb_sizes,
+                num_q_pos=num_q_pos_map,
             )
         self.vocab = vocab
         self.num_q = self.vocab.num_quantizers
+        self.num_q_pos = self.vocab.num_q_pos
 
     def __len__(self) -> int:
         return self.n_events
@@ -147,25 +173,42 @@ class HEPDataset(Dataset):
     def build_sequence(self, idx: int) -> np.ndarray:
         """Returns a (block_size,) int64 array — PAD on the right.
 
-        Each modality block emits `num_q[mod]` tokens per element, interleaved:
-        MOD_START, el0_q0, el0_q1, el0_q2, el1_q0, el1_q1, el1_q2, ...
+        Per-element token width = num_q[mod] + num_q_pos[mod]. Content first,
+        then pos per element. For each modality the block is:
+
+          MOD_START,
+          el0_c0..c{qc-1}, el0_p0..p{qp-1},
+          el1_c0..c{qc-1}, el1_p0..p{qp-1},
+          ...
+
+        Both input and output modalities emit content+pos. Inputs are
+        teacher-given (conditioning); output is AR-predicted (loss-masked).
         """
         parts = []
+        # ---- inputs ----
         for m in self.input_modalities:
-            num_q = self.num_q[m]
-            codes = self.inp_mms[m].event_codes(idx, num_q)  # (N, num_q)
-            V = self.vocab.codebook_sizes[m]
-            codes = np.clip(codes, 0, V - 1)
-            flat = self.vocab.encode_element_triples(m, codes)
+            num_q   = self.num_q[m]
+            num_qp  = self.num_q_pos[m]
+            V_c     = self.vocab.codebook_sizes[m]
+            V_p     = self.vocab.pos_codebook_sizes[m]
+            codes   = self.inp_mms[m].event_codes(idx, num_q)         # (N, nq_c)
+            pos     = self.inp_mms[m].event_pos_codes(idx, num_qp)    # (N, nq_p)
+            codes   = np.clip(codes, 0, V_c - 1)
+            pos     = np.clip(pos,   0, V_p - 1)
+            flat    = self.vocab.encode_element_triples_with_pos(m, codes, pos)
             parts.append(np.array([self.vocab.mod_start[m]], dtype=np.int64))
             parts.append(flat)
-        # Output block
-        out_m = self.output_modality
-        num_q_out = self.num_q[out_m]
-        out_codes = self.out_mm.event_codes(idx, num_q_out)
-        V_out = self.vocab.codebook_sizes[out_m]
-        out_codes = np.clip(out_codes, 0, V_out - 1)
-        out_flat = self.vocab.encode_element_triples(out_m, out_codes)
+        # ---- output ----
+        out_m   = self.output_modality
+        num_q_o = self.num_q[out_m]
+        num_qp_o = self.num_q_pos[out_m]
+        V_c_o   = self.vocab.codebook_sizes[out_m]
+        V_p_o   = self.vocab.pos_codebook_sizes[out_m]
+        out_codes = self.out_mm.event_codes(idx, num_q_o)
+        out_pos   = self.out_mm.event_pos_codes(idx, num_qp_o)
+        out_codes = np.clip(out_codes, 0, V_c_o - 1)
+        out_pos   = np.clip(out_pos,   0, V_p_o - 1)
+        out_flat = self.vocab.encode_element_triples_with_pos(out_m, out_codes, out_pos)
         parts.append(np.array([self.vocab.mod_start[out_m]], dtype=np.int64))
         parts.append(out_flat)
         parts.append(np.array([self.vocab.eos], dtype=np.int64))

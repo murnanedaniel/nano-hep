@@ -43,10 +43,16 @@ def main():
         num_q_map = {m: num_q_cfg for m in v_state["modalities"]}
     else:
         num_q_map = dict(num_q_cfg)
+    # Pos-token fields were added with gpos AR; older checkpoints may not have
+    # them stored — in that case, let Vocab.build use defaults (1024 / 3).
+    pos_cb_map = v_state.get("pos_codebook_sizes")
+    num_qp_map = v_state.get("num_q_pos")
     vocab = Vocab.build(
         v_state["modalities"],
         v_state["codebook_sizes"],
         num_q_map,
+        pos_codebook_sizes=pos_cb_map,
+        num_q_pos=num_qp_map,
     )
     gpt_cfg = GPTConfig(**gpt_kwargs)
     model = GPT(gpt_cfg)
