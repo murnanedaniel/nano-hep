@@ -1,0 +1,56 @@
+# N-head smoke test. Resumes from the existing 16-GPU checkpoint,
+# runs a handful of steps with N-head enabled, exits. Validates:
+#   - architectural expansion on resume (strict=False + optimizer base-load + add N-head groups)
+#   - 5-tuple batch unpacking
+#   - combined loss computes without NaN
+#   - N-head forward produces gradient
+data:
+  tokenized_root: /global/cfs/cdirs/m4958/data/COCOA/Tokenized_89M
+  input_modalities: [track, topo]
+  output_modality: truthpart
+  num_quantizers: 3
+  block_size: 512
+  max_train_events: 2000
+  max_val_events: 512
+
+model:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  dropout: 0.0
+  bias: false
+
+lr:
+  peak: 1.2e-3
+  floor: 1.2e-4
+  warmup_steps: 500
+
+optim:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+
+pflow_metrics:
+  enabled: false   # skip VQ-VAE load for smoke
+
+n_head:
+  enabled: true
+  max_n: 20
+  loss_weight: 0.1
+
+training:
+  seed: 42
+  batch_size: 16
+  max_steps: 160000     # checkpoint is at ~155k, so ~5k "available" steps (hard limit)
+  log_every: 5
+  val_every: 20         # run one val round early to smoke-test N-head eval
+  ckpt_every: 100000    # don't overwrite the real ckpt
+  grad_clip: 1.0
+  num_workers: 2
+  compile: false
+  bf16: true
+  ar_eval_events: 16
+  out_dir: runs/nano_hep_89M_nhead_smoke
+  wandb: false
+  wandb_project: nano-hep
+  run_name: nhead-smoke

@@ -129,12 +129,14 @@ class HEPDataset(Dataset):
         num_quantizers: "dict | int" = 1,
         num_q_pos: "dict | int" = 3,
         pos_codebook_size: int = 1024,
+        return_n_head_signal: bool = False,
     ):
         self.split = split
         self.input_modalities = list(input_modalities)
         self.output_modality = output_modality
         self.block_size = block_size
 
+        self.return_n_head_signal = return_n_head_signal
         self.inp_mms = {m: ModalityMemmap.load(tokenized_root, split, m) for m in self.input_modalities}
         self.out_mm = ModalityMemmap.load(tokenized_root, split, output_modality)
         n_events_all = [self.out_mm.n_events] + [mm.n_events for mm in self.inp_mms.values()]
@@ -244,13 +246,21 @@ class HEPDataset(Dataset):
             loss[-1] = 0
         return loss
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         seq = self.build_sequence(idx)
         loss_mask = self.build_loss_mask(seq)
         x = torch.from_numpy(seq[:-1]).long()
         y = torch.from_numpy(seq[1:]).long()
         m = torch.from_numpy(loss_mask[:-1]).long()
-        return x, y, m
+        if not self.return_n_head_signal:
+            return x, y, m
+        # N-head signals: position of [MOD_START_output] in x (== output_region_slice(seq)[0],
+        # which is always < block_size when the event fits) and the TRUE cardinality.
+        out_start_pos, _ = self.output_region_slice(seq)
+        # Clamp in case of truncation (very rare; would mean prefix filled the block).
+        n_head_pos = int(min(max(out_start_pos, 0), x.shape[0] - 1))
+        n_truth = int(self.out_mm.offsets[idx + 1] - self.out_mm.offsets[idx])
+        return x, y, m, torch.tensor(n_head_pos, dtype=torch.long), torch.tensor(n_truth, dtype=torch.long)
 
     # --- metric helpers (used by train_hep.py val) ---------------------------
 

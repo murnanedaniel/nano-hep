@@ -15,3 +15,8 @@ venv/
 # nano_hep experiment artifacts
 runs/
 wandb/
+
+# scan / analysis output dirs + caches + scratch drafts
+notebooks/results_*/
+notebooks/cache_*/
+*.new

@@ -32,6 +32,7 @@ sys.path.insert(0, str(_REPO))
 
 from model import GPT, GPTConfig  # noqa: E402  (upstream nanoGPT)
 from .data import HEPDataset      # noqa: E402
+from .model_nhead import GPTWithNHead  # noqa: E402
 from .vocab import Vocab, DEFAULT_MODALITY_CODEBOOK_SIZE, DEFAULT_MODALITY_NUM_QUANTIZERS  # noqa: E402
 
 
@@ -84,33 +85,58 @@ def _get_lr(step: int, cfg: Dict[str, Any]) -> float:
 
 @torch.no_grad()
 def estimate_val_loss(model, val_loader, device, vocab, max_batches: int = 10) -> Dict[str, float]:
-    """Teacher-forced metrics: val_loss, token_accuracy on output positions."""
+    """Teacher-forced metrics: val_loss, token_accuracy on output positions.
+    If the batch is a 5-tuple (n-head enabled), also compute N-head accuracy."""
     model.eval()
     losses = []
     total_tokens = 0
     n_correct = 0
     n_total = 0
-    for i, (x, y, m) in enumerate(val_loader):
+    n_head_correct = 0
+    n_head_total = 0
+    n_head_abs_err = 0
+    for i, batch in enumerate(val_loader):
         if i >= max_batches: break
+        has_nhead = len(batch) == 5
+        if has_nhead:
+            x, y, m, n_head_pos, n_targets = batch
+            n_head_pos = n_head_pos.to(device, non_blocking=True)
+            n_targets = n_targets.to(device, non_blocking=True)
+        else:
+            x, y, m = batch
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         m = m.to(device, non_blocking=True)
         y_mask = _apply_loss_mask(y, m)
-        logits, loss = model(x, targets=y_mask)
+        if has_nhead and hasattr(model, "n_head_mlp"):
+            out = model(x, targets=y_mask, n_head_pos=n_head_pos, n_targets=n_targets)
+            logits, loss = out[0], out[1]
+            # compute n_head acc
+            h_at = None  # direct n_logits not returned in this path — re-run head
+            n_logits = model.n_head_predict(x, n_head_pos)
+            n_pred = n_logits.argmax(dim=-1)
+            n_head_correct += (n_pred == n_targets.clamp(0, n_logits.shape[-1] - 1)).sum().item()
+            n_head_total += n_targets.shape[0]
+            n_head_abs_err += (n_pred - n_targets.clamp(0, n_logits.shape[-1] - 1)).abs().sum().item()
+        else:
+            logits, loss = model(x, targets=y_mask)
         if loss is not None and not torch.isnan(loss):
             losses.append(loss.item())
             total_tokens += m.sum().item()
-        # token accuracy on loss-mask positions
         pred = logits.argmax(dim=-1)  # (B, T)
         mask_bool = m.bool()
         n_correct += ((pred == y) & mask_bool).sum().item()
         n_total += mask_bool.sum().item()
     model.train()
-    return {
+    out = {
         "val_loss": float(np.mean(losses)) if losses else float("nan"),
         "val_tokens": total_tokens,
         "val_token_accuracy": float(n_correct / max(n_total, 1)),
     }
+    if n_head_total > 0:
+        out["val_nhead_acc"] = float(n_head_correct / n_head_total)
+        out["val_nhead_mae"] = float(n_head_abs_err / n_head_total)
+    return out
 
 
 @torch.no_grad()
@@ -118,6 +144,7 @@ def autoregressive_eval_with_pflow(
     model, val_ds, device, vocab,
     n_events: int = 64, max_new_tokens: int = 64,
     pflow=None,  # optional PflowMetrics instance
+    nhead_mode: str = "free",   # "free" | "floor" | "force"
 ) -> Dict[str, Any]:
     """Like autoregressive_eval, but also collects per-event (content, pos)
     code pairs so pflow metrics can be computed via VQ-VAE + PosTokenizer
@@ -129,6 +156,16 @@ def autoregressive_eval_with_pflow(
     token aborts the parser and discards the tail — so a poorly-calibrated
     model simply yields fewer complete elements (honest behavior, no
     truth-pos oracle).
+
+    `nhead_mode` (requires model to have `n_head_mlp`):
+      - "free"   : plain EOS termination (default, backwards-compat).
+      - "floor"  : mask EOS until we've emitted >= GROUP*N_hat tokens, then
+                   allow EOS. Guarantees n_pred >= N_hat; an honest lower
+                   floor from the N-head.
+      - "force"  : mask EOS always, stop after exactly GROUP*N_hat tokens.
+                   Locks n_pred to the N-head's argmax.
+    For floor/force, N_hat is computed once per event from the N-head logits
+    at the last prefix position (the output-modality MOD_START token).
 
     If `pflow` is provided, returns the full pflow dict merged into `out`.
     """
@@ -155,6 +192,8 @@ def autoregressive_eval_with_pflow(
     pred_codes_list, pred_pos_list = [], []
     n_cb_true = val_ds.out_mm.n_codebooks
     n_pos_true = val_ds.out_mm.n_pos_codebooks
+    assert nhead_mode in ("free", "floor", "force"), f"bad nhead_mode={nhead_mode!r}"
+    use_nhead_assist = nhead_mode != "free" and hasattr(model, "n_head_mlp")
     for i in range(B):
         # --- truth (content + pos) ---
         a = int(val_ds.out_mm.offsets[i]); b = int(val_ds.out_mm.offsets[i + 1])
@@ -171,9 +210,46 @@ def autoregressive_eval_with_pflow(
         cur = prefix
         max_len = min(val_ds.block_size, prefix_len + max_new_tokens)
         emitted = []
+
+        # If nhead-assisted, ask the N-head for N_hat at the [MOD_START_out] position
+        # (== out_start_pos == prefix_len - 1). One extra forward-through-backbone call
+        # per event; cost dwarfed by the AR loop that follows.
+        n_hat_tokens = None
+        if use_nhead_assist:
+            pos_t = torch.tensor([prefix.shape[1] - 1], dtype=torch.long, device=device)
+            n_logits = model.n_head_predict(prefix, pos_t)          # (1, max_n+1)
+            n_hat = int(n_logits.argmax(dim=-1).item())
+            n_hat_tokens = GROUP * n_hat
+
         while cur.shape[1] < max_len:
+            # Early-stop if "force" mode has emitted its full quota.
+            if nhead_mode == "force" and len(emitted) >= n_hat_tokens:
+                break
             logits, _ = model(cur)
-            next_tok = int(logits[0, -1].argmax().item())
+            last = logits[0, -1]
+
+            # Slot-aware masking for floor/force:
+            # - "force": always restrict logits to the valid per-slot range AND mask EOS.
+            #   This guarantees every emitted token is parseable → strict group parser
+            #   accepts 6*N_hat tokens as N_hat valid groups → card = N_hat.
+            # - "floor": apply the same restriction only while we're below 6*N_hat; above
+            #   it, fall back to vanilla AR (any token, EOS allowed).
+            # Otherwise (free mode) the logits are used as-is.
+            slot_in_group = len(emitted) % GROUP
+            restrict = (nhead_mode == "force") or \
+                       (nhead_mode == "floor" and len(emitted) < n_hat_tokens)
+            if restrict:
+                if slot_in_group < nq_c:
+                    lo = content_lo + slot_in_group * V_c
+                    hi = lo + V_c
+                else:
+                    q = slot_in_group - nq_c
+                    lo = pos_lo + q * V_p
+                    hi = lo + V_p
+                masked = torch.full_like(last, float("-inf"))
+                masked[lo:hi] = last[lo:hi]
+                last = masked
+            next_tok = int(last.argmax().item())
             if next_tok == vocab.eos:
                 break
             emitted.append(next_tok)
@@ -406,6 +482,8 @@ def main():
     if main_rank:
         print(f"Vocab: {v}")
 
+    nhead_cfg = cfg.get("n_head", {"enabled": False})
+    use_nhead = bool(nhead_cfg.get("enabled", False))
     train_ds = HEPDataset(
         tokenized_root=cfg["data"]["tokenized_root"],
         split="train",
@@ -413,6 +491,7 @@ def main():
         block_size=cfg["data"]["block_size"],
         max_events=cfg["data"].get("max_train_events", -1),
         vocab=v,
+        return_n_head_signal=use_nhead,
     )
     val_ds = HEPDataset(
         tokenized_root=cfg["data"]["tokenized_root"],
@@ -421,6 +500,7 @@ def main():
         block_size=cfg["data"]["block_size"],
         max_events=cfg["data"].get("max_val_events", 512),
         vocab=v,
+        return_n_head_signal=use_nhead,
     )
     if main_rank:
         print(f"train events: {len(train_ds):,}  val events: {len(val_ds):,}")
@@ -450,7 +530,13 @@ def main():
         dropout=cfg["model"].get("dropout", 0.0),
         bias=cfg["model"].get("bias", False),
     )
-    model = GPT(gpt_cfg).to(device)
+    if use_nhead:
+        max_n = int(nhead_cfg.get("max_n", 20))
+        model = GPTWithNHead(gpt_cfg, max_n=max_n).to(device)
+        if main_rank:
+            print(f"[n_head] enabled (max_n={max_n}, loss_weight={nhead_cfg.get('loss_weight', 0.1)})")
+    else:
+        model = GPT(gpt_cfg).to(device)
     if device == "cuda" and cfg["training"].get("compile", False):
         if main_rank: print("torch.compile...")
         model = torch.compile(model)
@@ -483,15 +569,48 @@ def main():
             resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
             # Model state — tolerate DDP-wrapped vs raw
             msd = resume_state["model"]
-            try:
-                raw_model.load_state_dict(msd)
-            except Exception:
-                # strip module. prefix if present
+            if any(k.startswith("module.") for k in msd.keys()):
                 msd = {k.replace("module.", "", 1) if k.startswith("module.") else k: v
                        for k, v in msd.items()}
-                raw_model.load_state_dict(msd)
+            ckpt_has_nhead = any(k.startswith("n_head_mlp") for k in msd.keys())
+            arch_expand = use_nhead and not ckpt_has_nhead
+            load_info = raw_model.load_state_dict(msd, strict=not arch_expand)
+            if arch_expand and main_rank:
+                missing = [k for k in getattr(load_info, "missing_keys", []) if k.startswith("n_head_mlp")]
+                print(f"[resume] architectural expansion: base GPT loaded, "
+                      f"{len(missing)} N-head params freshly initialized", flush=True)
             if "optimizer" in resume_state:
-                optimizer.load_state_dict(resume_state["optimizer"])
+                saved_groups = len(resume_state["optimizer"].get("param_groups", []))
+                if use_nhead:
+                    # Always use base-only + add-nhead schema for N-head runs so the
+                    # param_group layout matches the schema that was saved.
+                    # (arch_expand=True saves fresh nhead state; arch_expand=False
+                    #  loads existing nhead state from the saved 3rd/4th groups.)
+                    if main_rank:
+                        print(f"[resume] rebuilding optimizer under N-head schema "
+                              f"(arch_expand={arch_expand}, saved_groups={saved_groups})",
+                              flush=True)
+                    optimizer = raw_model.configure_optimizers_base_only(
+                        weight_decay=cfg["optim"]["weight_decay"],
+                        learning_rate=cfg["lr"]["peak"],
+                        betas=(cfg["optim"]["beta1"], cfg["optim"]["beta2"]),
+                        device_type=device_type,
+                    )
+                    if arch_expand:
+                        # Old ckpt has base-only optimizer (2 groups); load, then append nhead.
+                        optimizer.load_state_dict(resume_state["optimizer"])
+                        raw_model.add_n_head_param_groups(
+                            optimizer, weight_decay=cfg["optim"]["weight_decay"],
+                        )
+                    else:
+                        # Old ckpt already has nhead groups appended — add_n_head first so
+                        # both sides have the same group count before loading state.
+                        raw_model.add_n_head_param_groups(
+                            optimizer, weight_decay=cfg["optim"]["weight_decay"],
+                        )
+                        optimizer.load_state_dict(resume_state["optimizer"])
+                else:
+                    optimizer.load_state_dict(resume_state["optimizer"])
             if "scaler" in resume_state and resume_state["scaler"] is not None:
                 try:
                     scaler.load_state_dict(resume_state["scaler"])
@@ -561,16 +680,25 @@ def main():
     if train_sampler is not None:
         train_sampler.set_epoch(epoch)
     data_iter = iter(train_loader)
+    n_head_loss_weight = float(nhead_cfg.get("loss_weight", 0.1)) if use_nhead else 0.0
     while step < max_steps:
         try:
-            x, y, m = next(data_iter)
+            batch = next(data_iter)
         except StopIteration:
             epoch += 1
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
-            x, y, m = next(data_iter)
+            batch = next(data_iter)
 
+        if use_nhead and len(batch) == 5:
+            x, y, m, n_head_pos, n_targets = batch
+            n_head_pos = n_head_pos.to(device, non_blocking=True)
+            n_targets = n_targets.to(device, non_blocking=True)
+        else:
+            x, y, m = batch
+            n_head_pos = None
+            n_targets = None
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         m = m.to(device, non_blocking=True)
@@ -581,7 +709,19 @@ def main():
             pg["lr"] = lr
 
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=(device == "cuda")):
-            _, loss = model(x, targets=y_mask)
+            if n_head_pos is not None:
+                out = model(x, targets=y_mask, n_head_pos=n_head_pos, n_targets=n_targets)
+                if len(out) == 3:
+                    _, tok_loss, n_loss = out
+                    loss = tok_loss + n_head_loss_weight * n_loss
+                else:
+                    _, loss = out
+                    tok_loss = loss
+                    n_loss = None
+            else:
+                _, loss = model(x, targets=y_mask)
+                tok_loss = loss
+                n_loss = None
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         if grad_clip > 0:
@@ -595,11 +735,18 @@ def main():
             now = time.time()
             tps = (log_every * cfg["training"]["batch_size"] * world_size * (cfg["data"]["block_size"] - 1)) / (now - t_last)
             n_loss_tokens = m.sum().item()
-            msg = f"step {step}/{max_steps}  loss {loss.item():.4f}  lr {lr:.2e}  loss_tokens/batch {n_loss_tokens}  tok/s {tps:,.0f}"
+            extra = ""
+            if n_loss is not None:
+                extra = f"  tok_loss {tok_loss.item():.4f}  n_loss {n_loss.item():.4f}"
+            msg = f"step {step}/{max_steps}  loss {loss.item():.4f}{extra}  lr {lr:.2e}  loss_tokens/batch {n_loss_tokens}  tok/s {tps:,.0f}"
             print(msg, flush=True)
             if use_wandb:
-                wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/tok_per_s": tps,
-                           "train/loss_tokens_per_batch": n_loss_tokens, "step": step})
+                log = {"train/loss": loss.item(), "train/lr": lr, "train/tok_per_s": tps,
+                       "train/loss_tokens_per_batch": n_loss_tokens, "step": step}
+                if n_loss is not None:
+                    log["train/tok_loss"] = tok_loss.item()
+                    log["train/n_head_loss"] = n_loss.item()
+                wandb.log(log)
             t_last = now
 
         if (step % val_every == 0 or step == max_steps) and main_rank:
@@ -613,10 +760,48 @@ def main():
                 max_new_tokens=val_ds.block_size,
                 pflow=pflow,
             )
-            print(f"  val_loss {val['val_loss']:.4f}  tok_acc {val['val_token_accuracy']:.3f}  "
+            # If the N-head is live, also run two N-head-assisted evals so we
+            # can see how the head propagates to jet-level metrics:
+            #   floor : mask EOS (+ slot-range) until 6*N_hat tokens have been
+            #           emitted, then allow EOS. Guarantees n_pred >= N_hat, but
+            #           the model may choose to continue past N_hat.
+            #   force : mask EOS (+ slot-range) for the entire decode, stop
+            #           exactly at 6*N_hat. Locks n_pred = N_hat.
+            ar_floor = None
+            ar_nhead = None
+            if use_nhead and hasattr(raw_model, "n_head_mlp"):
+                ar_floor = autoregressive_eval_with_pflow(
+                    _val_model, val_ds, device, v,
+                    n_events=ar_n_events,
+                    max_new_tokens=val_ds.block_size,
+                    pflow=pflow,
+                    nhead_mode="floor",
+                )
+                ar_nhead = autoregressive_eval_with_pflow(
+                    _val_model, val_ds, device, v,
+                    n_events=ar_n_events,
+                    max_new_tokens=val_ds.block_size,
+                    pflow=pflow,
+                    nhead_mode="force",
+                )
+            nhead_msg = ""
+            if "val_nhead_acc" in val:
+                nhead_msg = f"  nhead_acc {val['val_nhead_acc']:.3f}  nhead_mae {val['val_nhead_mae']:.2f}"
+            floor_msg = ""
+            if ar_floor is not None:
+                floor_msg = (f"  floor_card_acc {ar_floor['ar_cardinality_acc']:.3f}"
+                             f"  floor_median {ar_floor.get('pflow_median_jet_pt_response', float('nan')):.3f}"
+                             f"  floor_iqr {ar_floor.get('pflow_iqr_jet_pt_response', float('nan')):.3f}")
+            forceN_msg = ""
+            if ar_nhead is not None:
+                forceN_msg = (f"  forceN_card_acc {ar_nhead['ar_cardinality_acc']:.3f}"
+                              f"  forceN_median {ar_nhead.get('pflow_median_jet_pt_response', float('nan')):.3f}"
+                              f"  forceN_iqr {ar_nhead.get('pflow_iqr_jet_pt_response', float('nan')):.3f}")
+            forceN_msg = floor_msg + forceN_msg
+            print(f"  val_loss {val['val_loss']:.4f}  tok_acc {val['val_token_accuracy']:.3f}{nhead_msg}  "
                   f"ar_card_acc {ar['ar_cardinality_acc']:.3f}  ar_card_mae {ar['ar_cardinality_mae']:.2f}  "
                   f"ar_tok_acc {ar['ar_token_accuracy']:.3f}  ar_n_pred {ar['ar_n_pred_mean']:.1f}±{ar['ar_n_pred_std']:.1f}  "
-                  f"(n_true {ar['ar_n_true_mean']:.1f}±{ar['ar_n_true_std']:.1f})",
+                  f"(n_true {ar['ar_n_true_mean']:.1f}±{ar['ar_n_true_std']:.1f}){forceN_msg}",
                   flush=True)
             if use_wandb:
                 log_dict = {
@@ -625,6 +810,9 @@ def main():
                     "val/token_accuracy": val["val_token_accuracy"],
                     "step": step,
                 }
+                if "val_nhead_acc" in val:
+                    log_dict["val/nhead_acc"] = val["val_nhead_acc"]
+                    log_dict["val/nhead_mae"] = val["val_nhead_mae"]
                 for k, vv in ar.items():
                     if k.startswith("_"):
                         continue
@@ -650,6 +838,24 @@ def main():
                         _r = _np_arr - _nt
                         log_dict["val/cardinality_bias"] = float(_r.mean())
                         log_dict["val/cardinality_std"]  = float(_r.std())
+                # Floor-N (EOS masked only BELOW 6*N_hat) + Force-N (EOS masked
+                # throughout, stops at 6*N_hat). Suffixed `_floorN` / `_forceN`
+                # so wandb panels can plot the three modes alongside free-AR.
+                def _log_mode(src, suffix):
+                    if src is None:
+                        return
+                    log_dict[f"val/cardinality_acc_{suffix}"] = src["ar_cardinality_acc"]
+                    log_dict[f"val/cardinality_mae_{suffix}"] = src["ar_cardinality_mae"]
+                    log_dict[f"val/n_pred_mean_{suffix}"]     = src["ar_n_pred_mean"]
+                    for k in ("pflow_median_jet_pt_response",
+                              "pflow_iqr_jet_pt_response",
+                              "pflow_mean_jet_pt_response",
+                              "pflow_std_jet_pt_response",
+                              "pflow_mean_reco_cardinality_at_threshold"):
+                        if k in src:
+                            log_dict[f"val_{k}_{suffix}"] = src[k]
+                _log_mode(ar_floor, "floorN")
+                _log_mode(ar_nhead, "forceN")
                 # Cardinality scatter plot (wandb Image) every val
                 try:
                     import matplotlib

@@ -120,37 +120,46 @@ def main():
             # fast_forward with sample_tokens=False → argmax in token_predictor
             # returns a dict with per-modality predictions inside `pred_tokens_dict`
             # (see hep4m.py:334-388)
+            # TRUE pflow evaluation: use the cardinality_predictor head, NOT truth
+            # cardinality and NOT indicator thresholding. This matches the real
+            # inference path (hep4m_fastforward_inference_helper.py).
             try:
-                # twostep API: fast_forward(input_dict, output_modalities, q_mask_dict,
-                #                          get_logits=True, use_truth_cardinality=..., target_dict=...)
                 pred = lm.model.fast_forward(
                     input_dict=batch["input"],
                     output_modalities=["truthpart"],
-                    q_mask_dict=batch.get("q_mask_dict"),
+                    q_mask_dict=None,                   # derived from predicted cardinality
                     get_logits=True,
-                    use_truth_cardinality=True,
+                    use_truth_cardinality=False,        # ← predict cardinality from head
+                    card_topk_dict={"truthpart": 1},    # ← argmax of cardinality predictor
+                    top_k_token_dict={"truthpart": 1},  # ← argmax of token predictor
+                    top_k_gpos_token_dict={"truthpart": 1},
                     target_dict=batch["target"],
                 )
             except TypeError:
-                # fallback for older single-arg API
                 pred = lm.model.fast_forward(batch, get_logits=True)
             except Exception as e:
                 print(f"batch {bi}: fast_forward failed: {e}"); continue
 
-            # lm.model.fast_forward returns the raw predicted_token_dict after mode step 6
-            # Structure: {modality: {'token_logits': (B,N,num_q,V), 'indicator_logits': (B,N),
-            #                        maybe 'gpos_token_logits': (B,N,num_q_pos,V_pos)}}
             if "truthpart" not in pred:
                 print(f"batch {bi}: no truthpart in pred; keys={list(pred.keys())}"); continue
             tp = pred["truthpart"]
-            token_logits = tp["token_logits"]              # (B,N,num_q,V)
-            indicator_logits = tp.get("indicator_logits")   # (B,N)
-            tokens = token_logits.argmax(dim=-1)             # (B,N,num_q)
-            # Threshold indicator → mask
-            if indicator_logits is not None:
-                pred_mask = (torch.sigmoid(indicator_logits) > 0.45)
+            token_logits = tp["token_logits"]              # (B,N_pred,num_q,V)
+            tokens = token_logits.argmax(dim=-1)           # (B,N_pred,num_q)
+
+            # Recover pred cardinality: in use_truth_cardinality=False path, the
+            # model spawns exactly `cardinality_predictor.argmax` slots and all of
+            # them are "real". Best signal for pred_mask is the full-slot mask.
+            # Compute per-event predicted N from cardinality_logits.
+            if "cardinality_logits" in tp:
+                pred_cardinality = tp["cardinality_logits"].argmax(dim=-1)  # (B,)
             else:
-                pred_mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+                # Fallback: count slots (they're all real when cardinality-driven)
+                pred_cardinality = torch.full((tokens.shape[0],), tokens.shape[1],
+                                               dtype=torch.long, device=tokens.device)
+            # Build pred_mask from cardinality
+            N_pred = tokens.shape[1]
+            arange = torch.arange(N_pred, device=tokens.device).unsqueeze(0)
+            pred_mask = arange < pred_cardinality.unsqueeze(1)  # (B,N_pred)
 
             # gpos: argmax if emitted, else use truth pos
             if "gpos_token_logits" in tp and tp["gpos_token_logits"] is not None:

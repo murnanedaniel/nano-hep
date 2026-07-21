@@ -34,7 +34,7 @@ while true; do
   SALLOC_OUT=$(mktemp)
   salloc --no-shell \
     -N 4 -n 4 --ntasks-per-node=1 --cpus-per-task=128 --gpus-per-node=4 \
-    -C "gpu&hbm80g" -A m4958_g -t 4:00:00 -q interactive \
+    -C "gpu&hbm80g" -A m3443_g -t 4:00:00 -q interactive \
     > "$SALLOC_OUT" 2>&1
   cat "$SALLOC_OUT" | tee -a "$JOURNAL"
   JOBID=$(grep -oE "job allocation [0-9]+" "$SALLOC_OUT" | tail -1 | awk '{print $3}')
